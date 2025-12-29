@@ -31,9 +31,23 @@
   .panel-row { display: flex; gap: 10px; margin-top: 10px; }
   .panel-half { flex: 1; min-width: 0; }
 
-  #wrap { position:relative; width:var(--canvas-w); height:var(--canvas-h); background:#fff; border:1px solid #ccc; border-radius:8px; }
-  canvas { position:absolute; inset:0; }
-  #base { z-index:1; } #overlay { z-index:2; pointer-events:auto; cursor:crosshair; }
+#wrap { position:relative; width:var(--canvas-w); height:var(--canvas-h); background:#fff; border:1px solid #ccc; border-radius:8px; }
+
+/* Only the main drawing canvases are absolute */
+#wrap canvas { position:absolute; inset:0; }
+
+#base { z-index:1; }
+#overlay { z-index:2; pointer-events:auto; cursor:crosshair; }
+
+/* Ensure plot canvases stay in normal document flow */
+#loadVsStepCanvas,
+#loadVsDispCanvas,
+#stressPanel {
+  position: static;
+  inset: auto;
+  display: block;
+}
+
 
   .panel { width:var(--panel-w); }
   .list { font-size:13px; max-height:240px; overflow:auto; border:1px dashed #ddd; padding:8px; border-radius:8px; }
@@ -421,7 +435,9 @@
         if(baseDOF !== undefined){
           const u = U[baseDOF] || 0;
           const v = U[baseDOF+1] || 0;
-          poly.push({ x_up: anode.x_up + u, y_up: anode.y_up + v, u, v });
+
+poly.push({ x0_up: anode.x_up, y0_up: anode.y_up, u, v });
+
         }
       }
       sublines.push(poly);
@@ -839,38 +855,35 @@
         if (!anim.t0) anim.t0 = ts;
 
         const elapsed = ts - anim.t0;
-        const step = Math.floor(elapsed / msPerStep);
 
-        if (step !== lastStep) {
-          lastStep = step;
+const stepRaw = Math.floor(elapsed / msPerStep);
+const step = stepRaw % (maxIdx + 1);
 
-          if (step > maxIdx) {
-            stopAnim();
-            return;
-          }
+if (step !== lastStep) {
+  lastStep = step;
 
-          const pos = collapseHistory[step].nodePositions;
-          if (pos) {
-            for (const n of nodes) {
-              const p = pos.find(q => q.id === n.id);
-              if (p) { n.x = p.x; n.y = p.y; }
-            }
-          }
+  const pos = collapseHistory[step].nodePositions;
+  if (pos) {
+    for (const n of nodes) {
+      const p = pos.find(q => q.id === n.id);
+      if (p) { n.x = p.x; n.y = p.y; }
+    }
+  }
 
-          // Use stored U so internal curvature is displayed per step
-          const build = buildAnalysisModelFrame();
-          const U = collapseHistory[step].U || new Array(build.N).fill(0);
-          const sublines = generateSublines(build, U, 10);
-          lastSolution = { sublines, Ufull: U };
+  const build = buildAnalysisModelFrame();
+  const U = collapseHistory[step].U || new Array(build.N).fill(0);
+  const sublines = generateSublines(build, U, 10);
+  lastSolution = { sublines, Ufull: U };
 
-          draw(1.0);
+  draw(1.0);
 
-          ctx.save();
-          ctx.fillStyle = 'black';
-          ctx.font = 'bold 14px sans-serif';
-          ctx.fillText(`λ = ${collapseHistory[step].lambda.toFixed(3)}, step ${step}/${maxIdx}`, 10, 20);
-          ctx.restore();
-        }
+  ctx.save();
+  ctx.fillStyle = 'black';
+  ctx.font = 'bold 14px sans-serif';
+  ctx.fillText(`λ = ${collapseHistory[step].lambda.toFixed(3)}, step ${step}/${maxIdx}`, 10, 20);
+  ctx.restore();
+}
+
 
         anim.raf = requestAnimationFrame(tick);
       };
@@ -1208,24 +1221,34 @@
     }
 
     // deformed shape (sublines already include displacements in x_up/y_up space)
-    if(lastSolution && lastSolution.sublines){
-      let scale = parseFloat(document.getElementById('defScale').value)||1;
-      if(scaleOverride !== undefined) scale = scaleOverride;
-      // NOTE: in your current subline construction, scale is not applied.
-      // You can incorporate scale by blending between anode position and displaced position if desired later.
-      ctx.save(); ctx.lineWidth=3; ctx.strokeStyle='#e11d48';
-      for(const poly of lastSolution.sublines){
-        ctx.beginPath();
-        for(let k=0; k<poly.length; k++){
-          const p=poly[k];
-          const S=worldToScreen(p.x_up, yCanvas(p.y_up));
-          if(k===0) ctx.moveTo(S.x,S.y); else ctx.lineTo(S.x,S.y);
-        }
-        ctx.stroke();
-      }
-      ctx.restore();
-    }
+// deformed shape (apply scale to displacement)
+if (lastSolution && lastSolution.sublines){
+  let scale = parseFloat(document.getElementById('defScale').value) || 1;
+  if (scaleOverride !== undefined) scale = scaleOverride;
 
+  ctx.save(); ctx.lineWidth = 3; ctx.strokeStyle = '#e11d48';
+
+  for (const poly of lastSolution.sublines){
+    ctx.beginPath();
+    for (let k=0; k<poly.length; k++){
+      const p = poly[k];
+
+      // Backward-compatible if any old points exist
+      const x0 = (p.x0_up !== undefined) ? p.x0_up : (p.x_up - (p.u||0));
+      const y0 = (p.y0_up !== undefined) ? p.y0_up : (p.y_up - (p.v||0));
+
+      const x_up = x0 + scale * (p.u || 0);
+      const y_up = y0 + scale * (p.v || 0);
+
+      const S = worldToScreen(x_up, yCanvas(y_up));
+      if (k === 0) ctx.moveTo(S.x, S.y);
+      else ctx.lineTo(S.x, S.y);
+    }
+    ctx.stroke();
+  }
+
+  ctx.restore();
+}
     drawSelection();
   }
 
@@ -1414,3 +1437,4 @@
 </script>
 </body>
 </html>
+
