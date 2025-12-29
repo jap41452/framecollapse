@@ -61,7 +61,7 @@
     <button id="btnUndo"  class="ghost">Undo</button>
     <button id="btnClear" class="ghost">Clear</button>
     <span class="hint" style="margin-left:6px;">
-      Double-click a member to set Yield Stress (Fy) and Shape Factor.
+      Double-click member to set Fy and ShapeF.
     </span>
   </div>
 
@@ -73,8 +73,8 @@
       </div>
 
       <div class="controls split" style="margin-top:10px; gap:12px;">
-        <button class="ghost labelbtn" disabled>Segment Divisions</button>
-        <input id="divCount"  type="number" min="1" max="50" value="10" style="width:80px;">
+        <button class="ghost labelbtn" disabled>Seg Divs</button>
+        <input id="divCount"  type="number" min="1" max="50" value="10" style="width:60px;">
 
         <button id="btnSolve" class="primary">Solve Static</button>
         
@@ -83,14 +83,14 @@
         <button id="viewDef"  class="ghost">Deflections</button>
         <button id="viewStressPanel" class="ghost">Stresses</button>
 
-        <button class="ghost labelbtn" disabled>Deflection Scale</button>
-        <input id="defScale"  type="number" step="any" value="1" style="width:80px;">
+        <button class="ghost labelbtn" disabled>Def Scale</button>
+        <input id="defScale"  type="number" step="any" value="1" style="width:60px;">
 
-        <button id="btnSaveInput" class="ghost">Save Input</button>
-        <button id="btnLoadInput" class="ghost">Load Input</button>
+        <button id="btnSaveInput" class="ghost">Save</button>
+        <button id="btnLoadInput" class="ghost">Load</button>
         <input id="fileInput" type="file" accept=".json,application/json" style="display:none;">
 
-        <button id="btnResetView" class="ghost">Reset Results</button>
+        <button id="btnResetView" class="ghost">Reset</button>
       </div>
     </div>
 
@@ -101,7 +101,7 @@
           <button id="btnUS" class="ghost">US (in, lbs, psi)</button>
           <button id="btnSI" class="ghost">SI (m, N, Pa)</button>
         </div>
-        <div class="hint">Ensure E and Fy units match (e.g. psi and psi).</div>
+        <div class="hint">Ensure E and Fy units match (e.g. psi).</div>
       </div>
 
       <div class="panel-row">
@@ -143,7 +143,7 @@
             <canvas id="stressPanel"></canvas>
             <div id="stressPanelHint" class="hint" style="margin-top:6px;">
               <div id="stressSummary" class="list" style="margin-top:6px;"></div>
-              Click a member to plot stresses.
+              Click member to plot stresses.
             </div>
           </div>
         </div>
@@ -355,7 +355,7 @@
         members = obj.members.map(m=>({
           id:m.id, n1:m.n1, n2:m.n2,
           E:m.E||0, A:m.A||0, I:m.I||0, S:m.S||0, c:m.c||0, wd:m.wd||0,
-          Fy:m.Fy||36000, shapeF:m.shapeF||1.15, // load new props
+          Fy:m.Fy||36000, shapeF:m.shapeF||1.15, 
           label:m.label||`M${m.id}`
         }));
         nextNodeId = (nodes.reduce((a,n)=>Math.max(a,n.id),0) || 0) + 1;
@@ -376,80 +376,52 @@
   
   // === CHECK CRITICAL LOADS LOGIC ===
   document.getElementById('btnCheckCritical').onclick = () => {
-    // 1. Run Static Solve first to get current distribution
-    solveFrame(true); // Pass true to suppress normal alert
+    solveFrame(true); 
     if(!lastSolution) return; 
 
-    const report = [];
     let minLambda = Infinity;
     let criticalReason = "";
     let criticalMemId = null;
 
-    // 2. Iterate members to check Yield and Buckling
     for(const m of members) {
         const res = lastSolution.stress[m.id];
         const sum = lastSolution.stressSummary[m.id];
         if(!res || !sum) continue;
 
-        // --- A. Yield Check (Plastic Moment) ---
-        // Mp = ShapeF * S * Fy
+        // Yield Check
         const Mp = (m.shapeF || 1.0) * (m.S || 0) * (m.Fy || 0);
         const Mmax = sum.MabsMax;
         
         let lambdaYield = Infinity;
-        if(Mp > 0 && Mmax > 0) {
-            lambdaYield = Mp / Mmax;
-        }
+        if(Mp > 0 && Mmax > 0) lambdaYield = Mp / Mmax;
 
-        // --- B. Euler Buckling Check ---
-        // Pcr = (pi^2 * E * I) / (K*L)^2
-        // Determine K based on supports
+        // Euler Buckling Check
         const n1 = nodeById(m.n1);
         const n2 = nodeById(m.n2);
-        
         const isPinned = (bc) => bc === 'simple' || bc === 'rollerX' || bc === 'rollerY';
-        // Simplistic assumption for frame: 
-        // If node is "Pinned" support -> Pinned end. 
-        // If node is "Fixed" support or Free (internal rigid joint) -> Fixed end.
-        const p1 = isPinned(n1.bc);
-        const p2 = isPinned(n2.bc);
+        const p1 = isPinned(n1.bc), p2 = isPinned(n2.bc);
 
-        let K_val = 0.5; // Default Fixed-Fixed
-        if (p1 && p2) K_val = 1.0;      // Pin-Pin
+        let K_val = 0.5; // Fix-Fix
+        if (p1 && p2) K_val = 1.0; // Pin-Pin
         else if (p1 || p2) K_val = 0.7; // Fix-Pin
 
         const L = res.L;
         const Pcr = (Math.PI**2 * m.E * m.I) / ((K_val * L)**2);
         
-        // Check against Compressive Axial Force only
-        // N is tension positive in this code? (Let's check solver)
-        // Usually finite element N is tension positive.
-        // We look for max compressive force.
-        // Let's iterate samples to find min N (max compression)
+        // Find max compression
         let minN = 0; 
         for(let val of res.N) if(val < minN) minN = val;
-        const Pcomp = Math.abs(minN); // Magnitude of compression
+        const Pcomp = Math.abs(minN); 
 
         let lambdaBuckle = Infinity;
-        if(Pcomp > 1e-9) {
-            lambdaBuckle = Pcr / Pcomp;
-        }
+        if(Pcomp > 1e-9) lambdaBuckle = Pcr / Pcomp;
 
-        // --- Compare ---
-        if(lambdaYield < minLambda) {
-            minLambda = lambdaYield;
-            criticalReason = "Plastic Hinge (Yield)";
-            criticalMemId = m.id;
-        }
-        if(lambdaBuckle < minLambda) {
-            minLambda = lambdaBuckle;
-            criticalReason = "Euler Buckling";
-            criticalMemId = m.id;
-        }
+        if(lambdaYield < minLambda) { minLambda = lambdaYield; criticalReason = "Plastic Hinge (Yield)"; criticalMemId = m.id; }
+        if(lambdaBuckle < minLambda) { minLambda = lambdaBuckle; criticalReason = "Euler Buckling"; criticalMemId = m.id; }
     }
 
     if(minLambda === Infinity) {
-        resultList.innerHTML = `<div>No valid loads or capacity found.</div>`;
+        resultList.innerHTML = `<div>No valid loads found.</div>`;
     } else {
         const html = `
             <div style="background:#fff3cd; padding:8px; border:1px solid #ffeeba; border-radius:6px; margin-bottom:10px;">
@@ -650,15 +622,31 @@
     }).then(res=>{ if(res.isConfirmed){ Object.assign(m,res.value); lastSolution=null; refreshLists(); draw(); } });
   }
 
-  // ... (Glyphs and Draw Functions same as before, simplified for brevity in this response) ...
-  function drawBCGlyph(g,bc){} // Placeholder if needed
+  function drawBCGlyph(g, bc){
+    g.clearRect(0,0,g.canvas.width,g.canvas.height);
+    g.save();
+    g.translate(30, g.canvas.height-20);
+    g.strokeStyle='#aaa'; g.lineWidth=1;
+    g.beginPath(); g.moveTo(-10,0); g.lineTo(140,0); g.stroke();
+    g.fillStyle='#000'; g.beginPath(); g.arc(0,0,4,0,Math.PI*2); g.fill();
+    if (bc==='fixed'){
+      g.lineWidth=6; g.strokeStyle='#222'; g.beginPath(); g.moveTo(-16, -20); g.lineTo(-16, 20); g.stroke();
+      g.lineWidth=1; g.strokeStyle='#666'; for (let k=-14; k<=14; k+=7){ g.beginPath(); g.moveTo(-16, k); g.lineTo(-24, k-6); g.stroke(); }
+    } else if (bc==='simple'){
+      g.beginPath(); g.moveTo(0, 6); g.lineTo(-12, 20); g.lineTo(12, 20); g.closePath(); g.fill(); g.fillRect(-16,20,32,3);
+    } else if (bc==='rollerX'){
+      g.beginPath(); g.moveTo(-6,0); g.lineTo(6,0); g.stroke(); g.fillRect(10, 2, 26, 3);
+    } else if (bc==='rollerY'){
+      g.beginPath(); g.moveTo(0,-6); g.lineTo(0,6); g.stroke(); g.fillRect(-18, 12, 3, 26);
+    }
+    g.restore();
+  }
   
   function draw(){
     ctx.clearRect(0,0,base.width,base.height);
     ovr.clearRect(0,0,overlay.width,overlay.height);
     drawGrid(ctx);
     
-    // Members
     ctx.save(); ctx.lineWidth=2; ctx.strokeStyle='#222'; ctx.font='12px system-ui'; ctx.fillStyle='#000';
     for (const m of members){
       const a=nodeById(m.n1), b=nodeById(m.n2);
@@ -669,26 +657,19 @@
     }
     ctx.restore();
 
-    // Nodes
     for (const n of nodes){
       const p=worldToScreen(n.x,n.y);
-      // Simple BC draw
       ctx.save(); ctx.fillStyle='#000';
       if(n.bc==='fixed') ctx.fillRect(p.x-8,p.y-8,16,16);
       else if(n.bc==='simple'){ ctx.beginPath(); ctx.moveTo(p.x,p.y); ctx.lineTo(p.x-6,p.y+10); ctx.lineTo(p.x+6,p.y+10); ctx.fill(); }
-      
-      // Node Dot
       ctx.fillStyle='#1d4ed8'; ctx.beginPath(); ctx.arc(p.x,p.y,4,0,Math.PI*2); ctx.fill();
-      
-      // Load Arrows
       ctx.strokeStyle='#db2777'; ctx.lineWidth=2;
       if(n.Fx){ ctx.beginPath(); ctx.moveTo(p.x,p.y); ctx.lineTo(p.x+30*(n.Fx>0?1:-1),p.y); ctx.stroke(); }
-      if(n.Fy){ ctx.beginPath(); ctx.moveTo(p.x,p.y); ctx.lineTo(p.x,p.y+30*(n.Fy<0?1:-1)); ctx.stroke(); } // Visually down for neg Fy
+      if(n.Fy){ ctx.beginPath(); ctx.moveTo(p.x,p.y); ctx.lineTo(p.x,p.y+30*(n.Fy<0?1:-1)); ctx.stroke(); }
       ctx.restore();
       drawCoordTag(ctx, p.x+10, p.y-12, `(${n.x.toFixed(1)}, ${n.y.toFixed(1)})`);
     }
     
-    // Deformed Shape
     if(viewMode==='def' && lastSolution && lastSolution.sublines){
         let scale = parseFloat(document.getElementById('defScale').value)||1;
         ctx.save(); ctx.lineWidth=2; ctx.strokeStyle='#e11d48';
@@ -721,29 +702,60 @@
   function drawGrid(g){
       g.save(); g.lineWidth=1; g.strokeStyle='#eee';
       const bbox=modelBounds();
-      // simplifed grid
-      const cx=bbox.x0+bbox.w/2, cy=bbox.y0+bbox.h/2;
       g.restore();
   }
 
-  // ... (Solver functions solveFrame, buildAnalysisModelFrame, frameLocalStiffness etc. are maintained from previous valid code, just ensured they run) ...
-  // [Solver code block inserted here implicitly from previous context]
-  
-  // Re-inserting critical solver parts for completeness in this snippet context
-  function solveFrame(silent=false){
+function buildAnalysisModelFrame(){
+  const anodes = {};
+  const dofMap = { primary:{}, analysis:{} };
+  let aNextId = 1;
+  for (const n of nodes){
+    const id = aNextId++;
+    anodes[id] = { x_up: n.x, y_up: yUp(n.y), primary: n.id };
+    const base = (id - 1) * 3;
+    dofMap.primary[n.id] = base;
+    dofMap.analysis[id]  = base;
+  }
+  const nA = Object.keys(anodes).length;
+  const N  = nA * 3;
+  const K  = zeros(N, N);
+  const F  = zeros(N);
+  const geom = {};
+
+  for (const m of members){
+    const ni = getAnalysisIdForPrimary(m.n1, anodes);
+    const nj = getAnalysisIdForPrimary(m.n2, anodes);
+    if (!ni || !nj) continue;
+    const pi = anodes[ni], pj = anodes[nj];
+    const dx = pj.x_up - pi.x_up, dy = pj.y_up - pi.y_up;
+    const L  = Math.hypot(dx, dy);
+    if (L < 1e-9) continue;
+    const c = dx / L, s = dy / L;
+    const E = m.E || 0, A = m.A || 0, I = m.I || 0;
+    if (!(E > 0 && A > 0 && I > 0)) continue;
+    const kLoc = frameLocalStiffness(E, A, I, L);
+    const T    = frameT(c, s);
+    const kG   = matMul6TKT(kLoc, T);
+    const baseI = dofMap.analysis[ni], baseJ = dofMap.analysis[nj];
+    const map   = [baseI, baseI+1, baseI+2, baseJ, baseJ+1, baseJ+2];
+    addToGlobalVar(K, kG, map);
+    geom[m.id] = { i: ni, j: nj, L, c, s, T };
+  }
+  return { N, dofMap, anodes, K, F, geom };
+}
+
+function solveFrame(silent=false){
       const DIV = Math.max(1, Math.min(50, (parseInt(document.getElementById('divCount').value) || 10)));
       try{
         const build = buildAnalysisModelFrame();
         const { N, dofMap, anodes, K, F, geom } = build;
         
-        // Node Loads
         for (const n of nodes){
             const base = dofMap.primary[n.id];
             if (base === undefined) continue;
             F[base+0] += n.Fx || 0; F[base+1] += n.Fy || 0; F[base+2] += n.Mz || 0;
         }
         
-        // BCs
         const constrained = new Set();
         for (const n of nodes){
             const base = dofMap.primary[n.id];
@@ -766,31 +778,35 @@
 
         const internal = computeInternalEndForces(build, U);
         
-        // Stresses
         const stress = {};
         const stressSummary = {};
         for (const m of members){
             const gEl = geom[m.id];
             const int = internal[m.id];
             if (!gEl || !int) continue;
-            
             const L = gEl.L;
             const xs=[], Ns=[], Ms=[], sigTop=[], sigBot=[], Vs=[];
             let NabsMax=0, MabsMax=0;
-            
-            for(let k=0; k<=10; k++){ // sparse sample for check
+            for(let k=0; k<=10; k++){ 
                 const t=k/10; 
                 const N_val = int.Ni*(1-t) + int.Nj*t;
                 const M_val = int.Mi*(1-t) + int.Mj*t;
                 xs.push(L*t); Ns.push(N_val); Ms.push(M_val);
                 NabsMax = Math.max(NabsMax, Math.abs(N_val));
                 MabsMax = Math.max(MabsMax, Math.abs(M_val));
+                
+                // Stress calc
+                let sTop=0, sBot=0;
+                if(m.A>0 && m.S>0){
+                    const sAx = N_val/m.A; const sB = M_val/m.S;
+                    sTop=sAx+sB; sBot=sAx-sB;
+                }
+                sigTop.push(sTop); sigBot.push(sBot);
             }
-            stress[m.id] = { L, x:xs, N:Ns, M:Ms }; // simplify for now
+            stress[m.id] = { L, x:xs, N:Ns, M:Ms, sigmaTop:sigTop, sigmaBot:sigBot }; 
             stressSummary[m.id] = { NabsMax, MabsMax };
         }
 
-        // Sublines for deflection (visual)
         const sublines = [];
         for (const m of members){
             const ni = nodeById(m.n1), nj = nodeById(m.n2);
@@ -800,7 +816,7 @@
             for (let k=0; k<=DIV; k++){
                 const t=k/DIV;
                 const x_up = ni.x + t*(nj.x-ni.x);
-                const y_up = yUp(ni.y + t*(nj.y-ni.y)); // visual coord
+                const y_up = yUp(ni.y + t*(nj.y-ni.y)); 
                 poly.push({ x_up, y_up, u: ui.u*(1-t)+uj.u*t, v: ui.v*(1-t)+uj.v*t });
             }
             sublines.push(poly);
@@ -808,7 +824,6 @@
 
         lastSolution = { Ufull:U, dofMap, sublines, stress, stressSummary };
         
-        // Show results
         let html = nodes.map(n=>{
             const b=dofMap.primary[n.id];
             return `<div>N${n.id}: ux=${round6(U[b])}, uy=${round6(U[b+1])}</div>`;
@@ -821,7 +836,30 @@
       } catch(e){ console.error(e); if(!silent) Swal.fire('Error', e.message, 'error'); }
   }
 
-  // ... (Math helpers: matPick, vecPick, frameLocalStiffness etc. copied from previous) ...
+function computeInternalEndForces(build, U){
+  const { dofMap, geom } = build;
+  const internal = {};
+  for (const memIdStr of Object.keys(geom)){
+    const memId = parseInt(memIdStr, 10);
+    const gEl   = geom[memId];
+    if (!gEl) continue;
+    const m = memberById(memId);
+    if (!m) continue;
+    const E=m.E, A=m.A, I=m.I;
+    const bi = dofMap.analysis[gEl.i];
+    const bj = dofMap.analysis[gEl.j];
+    const ue = [ U[bi], U[bi+1], U[bi+2], U[bj], U[bj+1], U[bj+2] ];
+    const u_loc = mulMatVec(gEl.T, ue);
+    const kLoc = frameLocalStiffness(E, A, I, gEl.L);
+    const f_loc = mulMatVec(kLoc, u_loc); 
+    internal[memId] = { Ni: f_loc[0], Vi: f_loc[1], Mi: f_loc[2], Nj: f_loc[3], Vj: f_loc[4], Mj: f_loc[5] };
+  }
+  return internal;
+}
+
+  // ===== Math helpers =====
+  function getAnalysisIdForPrimary(pid, anodes){ for (const [aid,obj] of Object.entries(anodes)){ if (obj.primary===pid) return parseInt(aid,10); } return null; }
+  function addToGlobalVar(K, ke, map){ for (let r=0;r<map.length;r++){ const R=map[r]; for (let c=0;c<map.length;c++){ const C=map[c]; K[R][C] += ke[r][c]; }}}
   function matPick(A,r,c){ const M=r.length,N=c.length,O=Array(M); for(let i=0;i<M;i++){ O[i]=Array(N); for(let j=0;j<N;j++)O[i][j]=A[r[i]][c[j]]; } return O; }
   function vecPick(v,r){ return r.map(i=>v[i]); }
   function zeros(n,m){ const A=Array(n); for(let i=0;i<n;i++) if(m) A[i]=Array(m).fill(0); else A[i]=0; return A; }
@@ -835,18 +873,18 @@
       k[5][1]=c; k[5][2]=e; k[5][4]=-c; k[5][5]=d;
       return k;
   }
-  function frameT(c,s){
-      return [ [c,s,0,0,0,0], [-s,c,0,0,0,0], [0,0,1,0,0,0], [0,0,0,c,s,0], [0,0,0,-s,c,0], [0,0,0,0,0,1] ];
-  }
-  function matMul6TKT(k,T){ 
-      // simplified for this snippet context
-      const KT=matMul(k,T); const TT=transpose(T); return matMul(TT,KT);
-  }
+  function frameT(c,s){ return [ [c,s,0,0,0,0], [-s,c,0,0,0,0], [0,0,1,0,0,0], [0,0,0,c,s,0], [0,0,0,-s,c,0], [0,0,0,0,0,1] ]; }
+  function matMul6TKT(k,T){ const KT=matMul(k,T); const TT=transpose(T); return matMul(TT,KT); }
   function matMul(A,B){
       const r=A.length, c=B[0].length, p=B.length;
       const C=Array(r).fill(0).map(()=>Array(c).fill(0));
       for(let i=0;i<r;i++) for(let j=0;j<c;j++) for(let k=0;k<p;k++) C[i][j]+=A[i][k]*B[k][j];
       return C;
+  }
+  function mulMatVec(M, v){
+    const n = M.length; const out = new Array(n).fill(0);
+    for (let i = 0; i < n; i++){ let sum = 0; const row = M[i]; for (let j = 0; j < row.length; j++) sum += row[j] * v[j]; out[i] = sum; }
+    return out;
   }
   function transpose(A){ return A[0].map((_,c)=>A.map(r=>r[c])); }
   function round6(x){ return Math.round(x*1e6)/1e6; }
@@ -862,6 +900,50 @@
   function refreshLists(){ 
       nodeList.innerHTML = nodes.map(n=>`<div>N${n.id}</div>`).join('');
       memberList.innerHTML = members.map(m=>`<div>M${m.id}: Fy=${m.Fy}</div>`).join('');
+  }
+  function toggleStressPanel(show){
+    stressBlock.style.display = show ? 'block' : 'none';
+    document.getElementById('stressPanelHint').style.display = show ? 'block' : 'none';
+    if(show){ 
+        stressCanvas.style.width='100%'; stressCanvas.width=stressCanvas.parentElement.clientWidth; stressCanvas.height=260; 
+        if(selectedMemberId) plotStressPanel();
+    }
+  }
+  
+  // Stress plot helper
+  function plotStressPanel(){
+      const spx = stressCanvas.getContext('2d');
+      spx.clearRect(0,0,stressCanvas.width,stressCanvas.height);
+      if (!lastSolution || !lastSolution.stress || !selectedMemberId){
+          spx.fillText('Select member',10,20); return;
+      }
+      const mData = lastSolution.stress[selectedMemberId];
+      if(!mData) return;
+      
+      const mode = document.getElementById('stressPlotMode').value;
+      let arr = (mode==='sigma')?mData.sigmaTop : (mode==='N'?mData.N : (mode==='V'?mData.V : mData.M));
+      // Auto-scale logic
+      let min=Infinity, max=-Infinity;
+      for(let v of arr){ min=Math.min(min,v); max=Math.max(max,v); }
+      if(!isFinite(min)) { min=-1; max=1; }
+      if(max===min){ min-=1; max+=1; }
+      
+      const W=stressCanvas.width, H=stressCanvas.height;
+      spx.beginPath(); spx.strokeStyle='#000';
+      for(let i=0; i<arr.length; i++){
+          const x = (i/(arr.length-1))*W;
+          const y = H - ((arr[i]-min)/(max-min))*(H-20) - 10;
+          if(i===0) spx.moveTo(x,y); else spx.lineTo(x,y);
+      }
+      spx.stroke();
+      spx.fillText(`Max: ${max.toFixed(2)}`, 10, 15);
+      spx.fillText(`Min: ${min.toFixed(2)}`, 10, H-5);
+  }
+
+  if (stressPlotModeSelect){
+    stressPlotModeSelect.addEventListener('change', () => {
+      if (viewMode === 'stresspanel') plotStressPanel();
+    });
   }
 
   // Kickoff
