@@ -185,7 +185,7 @@
   let movingNodeId = null;
   let moveOffset = {dx:0, dy:0};
 
-  let anim = { on:false, t0:0, raf:null, scaleOverride:null };
+  let anim = { on:false, t0:0, raf:null };
 
   // View Camera
   const view = { scale: 1, offsetX: 0, offsetY: 0, userAdjusted: false };
@@ -194,112 +194,213 @@
   let isPanning = false;
   const panStart = { sx: 0, sy: 0, offsetX: 0, offsetY: 0 };
 
-  // ===== Helpers =====
-  const dist2 = (a,b,x,y) => (a-x)*(a-x)+(b-y)*(b-y);
+  // ===== CORE SOLVER FUNCTIONS (Defined TOP-LEVEL to fix scope issues) =====
 
-  function worldToScreen(wx, wy){
-    return { x: wx * view.scale + view.offsetX, y: wy * view.scale + view.offsetY };
-  }
-  function screenToWorld(sx, sy){
-    return { x: (sx - view.offsetX) / view.scale, y: (sy - view.offsetY) / view.scale };
-  }
+  function buildAnalysisModelFrame(modifiers = null){
+    const anodes = {};
+    const dofMap = { primary:{}, analysis:{} };
+    let aNextId = 1;
+    const yUp = y => base.height - y; // Local helper
 
-  function autoFitView(){
-    if (nodes.length === 0){ view.scale = 1; view.offsetX = 0; view.offsetY = 0; return; }
-    const bbox = modelBounds();
-    const w = bbox.w; const h = bbox.h;
-    if (!(w > 0) || !(h > 0)){ view.scale = 1; view.offsetX = 0; view.offsetY = 0; return; }
-    const sx = (base.width  * 0.8) / w;
-    const sy = (base.height * 0.8) / h;
-    let s = Math.min(sx, sy);
-    s = Math.max(MIN_SCALE, Math.min(MAX_SCALE, s));
-    view.scale = s;
-    const cx = bbox.x0 + w/2; const cy = bbox.y0 + h/2;
-    view.offsetX = base.width /2 - cx * view.scale;
-    view.offsetY = base.height/2 - cy * view.scale;
-  }
-  function autoFitIfNeeded(){ if (!view.userAdjusted) autoFitView(); }
-
-  const nearNodeId = (x,y, tolPx=9) => {
-    const tolWorld = tolPx / view.scale;
-    let best=null, dmin=tolWorld*tolWorld;
-    for (const n of nodes) {
-      const d = dist2(n.x, n.y, x, y);
-      if (d <= dmin){ best=n; dmin=d; }
+    for (const n of nodes){
+        const id = aNextId++;
+        anodes[id] = { x_up: n.x, y_up: yUp(n.y), primary: n.id };
+        const baseDOF = (id - 1) * 3;
+        dofMap.primary[n.id] = baseDOF;
+        dofMap.analysis[id]  = baseDOF;
     }
-    return best ? best.id : null;
-  };
+    const nA = Object.keys(anodes).length;
+    const N  = nA * 3;
+    const K  = zeros(N, N);
+    const F  = zeros(N);
+    const geom = {};
 
-  const nodeById   = id => nodes.find(n=>n.id===id);
-  const memberById = id => members.find(m=>m.id===id);
-
-  const pointToSegmentDistance = (P, A, B) => {
-    const ABx=B.x-A.x, ABy=B.y-A.y, APx=P.x-A.x, APy=P.y-A.y;
-    const ab2 = ABx*ABx + ABy*ABy || 1e-9;
-    let t = (APx*ABx + APy*ABy)/ab2; 
-    t = Math.max(0,Math.min(1,t));
-    const Cx=A.x+t*(B.x-A.x), Cy=A.y+t*(B.y-A.y);
-    return Math.hypot(P.x-Cx, P.y-Cy);
-  };
-  const nearMemberId = (x,y, tolPx=6) => {
-    const tolWorld = tolPx / view.scale;
-    let bestId=null, best=tolWorld;
     for (const m of members){
-      const a=nodeById(m.n1), b=nodeById(m.n2);
-      const d=pointToSegmentDistance({x,y},a,b);
-      if (d<best){best=d; bestId=m.id;}
+        const ni = getAnalysisIdForPrimary(m.n1, anodes);
+        const nj = getAnalysisIdForPrimary(m.n2, anodes);
+        if (!ni || !nj) continue;
+        const pi = anodes[ni], pj = anodes[nj];
+        const dx = pj.x_up - pi.x_up, dy = pj.y_up - pi.y_up;
+        const L  = Math.hypot(dx, dy);
+        if (L < 1e-9) continue;
+        const c = dx / L, s = dy / L;
+        
+        let E = m.E || 0, A = m.A || 0, I = m.I || 0;
+        
+        if(modifiers && modifiers[m.id]){
+            E *= modifiers[m.id].E_fac;
+            A *= modifiers[m.id].A_fac;
+            I *= modifiers[m.id].I_fac;
+        }
+
+        if (!(E > 0 && A > 0 && I > 0)) continue;
+        const kLoc = frameLocalStiffness(E, A, I, L);
+        const T    = frameT(c, s);
+        const kG   = matMul6TKT(kLoc, T);
+        const baseI = dofMap.analysis[ni], baseJ = dofMap.analysis[nj];
+        const map   = [baseI, baseI+1, baseI+2, baseJ, baseJ+1, baseJ+2];
+        addToGlobalVar(K, kG, map);
+        geom[m.id] = { i: ni, j: nj, L, c, s, T };
     }
-    return bestId;
-  };
-
-  function addNode(x,y){
-    const id=nextNodeId++;
-    nodes.push({ id,x,y, bc:'free', Fx:0,Fy:0,Mz:0, Kx:0,Ky:0,Kt:0, Wn:0 });
-    refreshLists();
-    return id;
+    return { N, dofMap, anodes, K, F, geom };
   }
 
-  function addMember(n1,n2){
-    if (members.length>=MAX_MEMBERS){
-      Swal.fire('Limit reached','Max members reached.','info'); return null;
+  function solveFrameInternal(stiffMod = null){
+      const build = buildAnalysisModelFrame(stiffMod);
+      const { N, dofMap, K, F, geom } = build;
+      
+      // Loads
+      for (const n of nodes){
+          const base = dofMap.primary[n.id];
+          if (base === undefined) continue;
+          F[base+0] += n.Fx || 0; F[base+1] += n.Fy || 0; F[base+2] += n.Mz || 0;
+      }
+      
+      // BCs
+      const constrained = new Set();
+      for (const n of nodes){
+          const base = dofMap.primary[n.id];
+          if (base === undefined) continue;
+          if (n.bc === 'fixed'){ constrained.add(base+0); constrained.add(base+1); constrained.add(base+2); }
+          else if (n.bc === 'simple'){ constrained.add(base+0); constrained.add(base+1); }
+          else if (n.bc === 'rollerX'){ constrained.add(base+0); }
+          else if (n.bc === 'rollerY'){ constrained.add(base+1); }
+      }
+      
+      const allIdx = [...Array(N).keys()];
+      const freeIdx = allIdx.filter(i => !constrained.has(i));
+      if (freeIdx.length === 0) return null; 
+
+      const Kff = matPick(K, freeIdx, freeIdx);
+      const Ff  = vecPick(F, freeIdx);
+      
+      let Uf;
+      try { Uf = numeric.solve(Kff, Ff); } catch { return null; }
+      if(Uf.some(x=>!isFinite(x))) return null;
+      
+      const U = Array(N).fill(0);
+      freeIdx.forEach((gi, k) => { U[gi] = Uf[k]; });
+
+      const internal = computeInternalEndForces(build, U);
+      
+      // Basic Linear Stresses (for static output)
+      const stress = {};
+      const stressSummary = {};
+      for (const m of members){
+          const gEl = geom[m.id];
+          const int = internal[m.id];
+          if (!gEl || !int) continue;
+          const L = gEl.L;
+          const xs=[], Ns=[], Ms=[], sigTop=[], sigBot=[], Vs=[];
+          let NabsMax=0, MabsMax=0;
+          for(let k=0; k<=10; k++){ 
+              const t=k/10; 
+              const N_val = int.Ni*(1-t) + int.Nj*t;
+              const M_val = int.Mi*(1-t) + int.Mj*t;
+              xs.push(L*t); Ns.push(N_val); Ms.push(M_val);
+              NabsMax = Math.max(NabsMax, Math.abs(N_val));
+              MabsMax = Math.max(MabsMax, Math.abs(M_val));
+              let sTop=0, sBot=0;
+              if(m.A>0 && m.S>0){
+                  const sAx = N_val/m.A; const sB = M_val/m.S;
+                  sTop=sAx+sB; sBot=sAx-sB;
+              }
+              sigTop.push(sTop); sigBot.push(sBot);
+          }
+          stress[m.id] = { L, x:xs, N:Ns, M:Ms, sigmaTop:sigTop, sigmaBot:sigBot }; 
+          stressSummary[m.id] = { NabsMax, MabsMax };
+      }
+
+      const DIV = Math.max(1, Math.min(50, (parseInt(document.getElementById('divCount').value) || 10)));
+      const sublines = generateSublines(build, U, DIV);
+
+      return { Ufull:U, dofMap, sublines, stress, stressSummary };
+  }
+
+  function computeInternalEndForces(build, U){
+    const { dofMap, geom } = build;
+    const internal = {};
+    for (const memIdStr of Object.keys(geom)){
+        const memId = parseInt(memIdStr, 10);
+        const gEl   = geom[memId];
+        if (!gEl) continue;
+        const m = memberById(memId);
+        if (!m) continue;
+        const E=m.E, A=m.A, I=m.I;
+        const bi = dofMap.analysis[gEl.i];
+        const bj = dofMap.analysis[gEl.j];
+        const ue = [ U[bi], U[bi+1], U[bi+2], U[bj], U[bj+1], U[bj+2] ];
+        const u_loc = mulMatVec(gEl.T, ue);
+        const kLoc = frameLocalStiffness(E, A, I, gEl.L);
+        const f_loc = mulMatVec(kLoc, u_loc); 
+        internal[memId] = { Ni: f_loc[0], Vi: f_loc[1], Mi: f_loc[2], Nj: f_loc[3], Vj: f_loc[4], Mj: f_loc[5] };
     }
-    const id=nextMemberId++;
-    let E=29000000, A=10, I=100, S=10, c=0, wd=0, Fy=36000, shapeF=1.15, label=`M${id}`;
-    if (members.length>=1){
-      const t = members[members.length-1];
-      ({E,A,I,S,c,wd,Fy,shapeF} = t);
+    return internal;
+  }
+
+  function generateSublines(build, U, divCount){
+      const sublines = [];
+      const { dofMap } = build; 
+      const yUp = y => base.height - y;
+      
+      for (const m of members){
+          const niID = m.n1, njID = m.n2;
+          const bi = dofMap.primary[niID], bj = dofMap.primary[njID];
+          if(bi===undefined || bj===undefined) continue;
+          const nodeI = nodeById(niID), nodeJ = nodeById(njID);
+          const ui = { u: U[bi+0], v: U[bi+1] }, uj = { u: U[bj+0], v: U[bj+1] };
+          const poly = [];
+          for (let k=0; k<=divCount; k++){
+              const t=k/divCount;
+              const x_up = nodeI.x + t*(nodeJ.x-nodeI.x);
+              const y_up = yUp(nodeI.y + t*(nodeJ.y-nodeI.y)); 
+              poly.push({ x_up, y_up, u: ui.u*(1-t)+uj.u*t, v: ui.v*(1-t)+uj.v*t });
+          }
+          sublines.push(poly);
+      }
+      return sublines;
+  }
+
+  function toggleStressPanel(show){
+    stressBlock.style.display = show ? 'block' : 'none';
+    document.getElementById('stressPanelHint').style.display = show ? 'block' : 'none';
+    if(show){ 
+        stressCanvas.style.width='100%'; stressCanvas.width=stressCanvas.parentElement.clientWidth; stressCanvas.height=260; 
+        if(selectedMemberId) plotStressPanel();
     }
-    members.push({ id,n1,n2,E,A,I,S,c,wd, Fy, shapeF, label });
-    refreshLists();
-    return id;
-  }
-  function deleteMember(id){
-    const idx = members.findIndex(m=>m.id===id);
-    if (idx<0) return;
-    members.splice(idx,1);
-    lastSolution = null; collapseHistory=null;
-    refreshLists(); autoFitIfNeeded(); draw();
-  }
-  function deleteNodeWithMembers(nodeId){
-    const nidx = nodes.findIndex(n=>n.id===nodeId);
-    if (nidx<0) return;
-    members = members.filter(m => m.n1!==nodeId && m.n2!==nodeId);
-    nodes.splice(nidx,1);
-    lastSolution = null; collapseHistory=null;
-    refreshLists(); autoFitIfNeeded(); draw();
   }
 
-  const yUp      = yCanvas => base.height - yCanvas;
-  const yCanvas = yUpVal  => base.height - yUpVal;
-
-  const modeBtns = ['btnDraw','btnSelect'];
-  const viewBtns = ['viewGeom','viewDef','viewStressPanel'];
-  function setActiveGroup(ids, activeId){
-    ids.forEach(id => {
-      const el = document.getElementById(id);
-      if(el) el.classList.toggle('active', id===activeId);
-    });
+  // ===== MATH HELPERS =====
+  function getAnalysisIdForPrimary(pid, anodes){ for (const [aid,obj] of Object.entries(anodes)){ if (obj.primary===pid) return parseInt(aid,10); } return null; }
+  function addToGlobalVar(K, ke, map){ for (let r=0;r<map.length;r++){ const R=map[r]; for (let c=0;c<map.length;c++){ const C=map[c]; K[R][C] += ke[r][c]; }}}
+  function matPick(A,r,c){ const M=r.length,N=c.length,O=Array(M); for(let i=0;i<M;i++){ O[i]=Array(N); for(let j=0;j<N;j++)O[i][j]=A[r[i]][c[j]]; } return O; }
+  function vecPick(v,r){ return r.map(i=>v[i]); }
+  function zeros(n,m){ const A=Array(n); for(let i=0;i<n;i++) if(m) A[i]=Array(m).fill(0); else A[i]=0; return A; }
+  function frameLocalStiffness(E,A,I,L){
+      const k=Array(6).fill(0).map(()=>Array(6).fill(0));
+      const a=E*A/L, b=12*E*I/(L*L*L), c=6*E*I/(L*L), d=4*E*I/L, e=2*E*I/L;
+      k[0][0]=a; k[0][3]=-a; k[3][3]=a; k[3][0]=-a;
+      k[1][1]=b; k[1][2]=c; k[1][4]=-b; k[1][5]=c;
+      k[2][1]=c; k[2][2]=d; k[2][4]=-c; k[2][5]=e;
+      k[4][1]=-b; k[4][2]=-c; k[4][4]=b; k[4][5]=-c;
+      k[5][1]=c; k[5][2]=e; k[5][4]=-c; k[5][5]=d;
+      return k;
   }
+  function frameT(c,s){ return [ [c,s,0,0,0,0], [-s,c,0,0,0,0], [0,0,1,0,0,0], [0,0,0,c,s,0], [0,0,0,-s,c,0], [0,0,0,0,0,1] ]; }
+  function matMul6TKT(k,T){ const KT=matMul(k,T); const TT=transpose(T); return matMul(TT,KT); }
+  function matMul(A,B){
+      const r=A.length, c=B[0].length, p=B.length;
+      const C=Array(r).fill(0).map(()=>Array(c).fill(0));
+      for(let i=0;i<r;i++) for(let j=0;j<c;j++) for(let k=0;k<p;k++) C[i][j]+=A[i][k]*B[k][j];
+      return C;
+  }
+  function mulMatVec(M, v){
+    const n = M.length; const out = new Array(n).fill(0);
+    for (let i = 0; i < n; i++){ let sum = 0; const row = M[i]; for (let j = 0; j < row.length; j++) sum += row[j] * v[j]; out[i] = sum; }
+    return out;
+  }
+  function transpose(A){ return A[0].map((_,c)=>A.map(r=>r[c])); }
+  function round6(x){ return Math.round(x*1e6)/1e6; }
 
   // ===== UI Actions =====
   document.getElementById('btnDraw').onclick   = () => { mode='draw'; overlay.style.cursor='crosshair'; setActiveGroup(modeBtns,'btnDraw'); draw(); };
@@ -369,7 +470,24 @@
   document.getElementById('btnUS').onclick = () => { units='US'; Swal.fire('Units set','US (in, lbs, psi)','success'); };
   document.getElementById('btnSI').onclick = () => { units='SI'; Swal.fire('Units set','SI (m, N, Pa)','success'); };
 
-  document.getElementById('btnSolve').onclick = () => { solveFrame(false); };
+  // WRAPPER function for Static Solve UI
+  document.getElementById('btnSolve').onclick = () => { 
+      const sol = solveFrameInternal();
+      if(sol){
+          lastSolution = sol;
+          collapseHistory = null;
+          let html = nodes.map(n=>{
+            const b=sol.dofMap.primary[n.id];
+            return `<div>N${n.id}: ux=${round6(sol.Ufull[b])}, uy=${round6(sol.Ufull[b+1])}</div>`;
+          }).join('');
+          resultList.innerHTML = html;
+          draw();
+          Swal.fire('Solved', 'Static solution complete', 'success');
+      } else {
+          Swal.fire('Error', 'Singular Matrix or Constraints', 'error');
+      }
+  };
+
   document.getElementById('btnResetView').onclick = () => { lastSolution=null; collapseHistory=null; selectedMemberId=null; draw(); };
 
   // ============================================
@@ -496,21 +614,13 @@
         if(newFailures.length > 0) logHtml += `<div style="color:#b91c1c; font-size:11px;">Step ${step}: ${newFailures.join(', ')}</div>`;
 
         // 2. Solve for Increment (Delta U)
-        // We use solveFrameInternal with MODIFIERS.
-        // The solver uses the ORIGINAL Load Vector F.
-        // We want Delta F = 0.1 * Critical_Load_Magnitude * F_unit? 
-        // No, we want 10% of the force vector corresponding to the Critical State.
-        // F_crit = minLambda * F_app.
-        // Delta F = 0.1 * F_crit = 0.1 * minLambda * F_app.
-        // The solver solves K' * U_sol = F_app.
-        // So Delta U = U_sol * (0.1 * minLambda).
-        
         const solInc = solveFrameInternal(stiffMod); 
         if(!solInc) {
             logHtml += `<div style="color:red;">Structure Unstable at Step ${step}</div>`;
             break;
         }
 
+        // Delta load = 10% of Base load * Critical factor
         const scaleFact = INC_PCT * minLambda;
         const deltaU = solInc.Ufull.map(u => u * scaleFact);
         
@@ -614,243 +724,129 @@
     draw();
   }
 
-  // ============================================
-  // === CORE SOLVER FUNCTIONS ===
-  // ============================================
-  
-  function solveFrameInternal(stiffMod = null){
-      const build = buildAnalysisModelFrame(stiffMod);
-      const { N, dofMap, K, F, geom } = build;
-      
-      // Loads
-      for (const n of nodes){
-          const base = dofMap.primary[n.id];
-          if (base === undefined) continue;
-          F[base+0] += n.Fx || 0; F[base+1] += n.Fy || 0; F[base+2] += n.Mz || 0;
-      }
-      
-      // BCs
-      const constrained = new Set();
-      for (const n of nodes){
-          const base = dofMap.primary[n.id];
-          if (base === undefined) continue;
-          if (n.bc === 'fixed'){ constrained.add(base+0); constrained.add(base+1); constrained.add(base+2); }
-          else if (n.bc === 'simple'){ constrained.add(base+0); constrained.add(base+1); }
-          else if (n.bc === 'rollerX'){ constrained.add(base+0); }
-          else if (n.bc === 'rollerY'){ constrained.add(base+1); }
-      }
-      
-      const allIdx = [...Array(N).keys()];
-      const freeIdx = allIdx.filter(i => !constrained.has(i));
-      if (freeIdx.length === 0) return null; 
-
-      const Kff = matPick(K, freeIdx, freeIdx);
-      const Ff  = vecPick(F, freeIdx);
-      
-      let Uf;
-      try { Uf = numeric.solve(Kff, Ff); } catch { return null; }
-      if(Uf.some(x=>!isFinite(x))) return null;
-      
-      const U = Array(N).fill(0);
-      freeIdx.forEach((gi, k) => { U[gi] = Uf[k]; });
-
-      const internal = computeInternalEndForces(build, U);
-      
-      // Basic Linear Stresses (for static output)
-      const stress = {};
-      const stressSummary = {};
-      for (const m of members){
-          const gEl = geom[m.id];
-          const int = internal[m.id];
-          if (!gEl || !int) continue;
-          const L = gEl.L;
-          const xs=[], Ns=[], Ms=[], sigTop=[], sigBot=[], Vs=[];
-          let NabsMax=0, MabsMax=0;
-          for(let k=0; k<=10; k++){ 
-              const t=k/10; 
-              const N_val = int.Ni*(1-t) + int.Nj*t;
-              const M_val = int.Mi*(1-t) + int.Mj*t;
-              xs.push(L*t); Ns.push(N_val); Ms.push(M_val);
-              NabsMax = Math.max(NabsMax, Math.abs(N_val));
-              MabsMax = Math.max(MabsMax, Math.abs(M_val));
-              let sTop=0, sBot=0;
-              if(m.A>0 && m.S>0){
-                  const sAx = N_val/m.A; const sB = M_val/m.S;
-                  sTop=sAx+sB; sBot=sAx-sB;
-              }
-              sigTop.push(sTop); sigBot.push(sBot);
-          }
-          stress[m.id] = { L, x:xs, N:Ns, M:Ms, sigmaTop:sigTop, sigmaBot:sigBot }; 
-          stressSummary[m.id] = { NabsMax, MabsMax };
-      }
-
-      const DIV = Math.max(1, Math.min(50, (parseInt(document.getElementById('divCount').value) || 10)));
-      const sublines = generateSublines(build, U, DIV);
-
-      return { Ufull:U, dofMap, sublines, stress, stressSummary };
-  }
-
-  function solveFrame(silent=false){
-      const sol = solveFrameInternal();
-      if(sol){
-          lastSolution = sol;
-          collapseHistory = null;
-          let html = nodes.map(n=>{
-            const b=sol.dofMap.primary[n.id];
-            return `<div>N${n.id}: ux=${round6(sol.Ufull[b])}, uy=${round6(sol.Ufull[b+1])}</div>`;
-          }).join('');
-          resultList.innerHTML = html;
-          draw();
-          if(!silent) Swal.fire('Solved', 'Static solution complete', 'success');
-      } else {
-          Swal.fire('Error', 'Singular Matrix or Constraints', 'error');
-      }
-  }
-
-  function buildAnalysisModelFrame(modifiers = null){
-    const anodes = {};
-    const dofMap = { primary:{}, analysis:{} };
-    let aNextId = 1;
-    for (const n of nodes){
-        const id = aNextId++;
-        anodes[id] = { x_up: n.x, y_up: yUp(n.y), primary: n.id };
-        const base = (id - 1) * 3;
-        dofMap.primary[n.id] = base;
-        dofMap.analysis[id]  = base;
-    }
-    const nA = Object.keys(anodes).length;
-    const N  = nA * 3;
-    const K  = zeros(N, N);
-    const F  = zeros(N);
-    const geom = {};
-
-    for (const m of members){
-        const ni = getAnalysisIdForPrimary(m.n1, anodes);
-        const nj = getAnalysisIdForPrimary(m.n2, anodes);
-        if (!ni || !nj) continue;
-        const pi = anodes[ni], pj = anodes[nj];
-        const dx = pj.x_up - pi.x_up, dy = pj.y_up - pi.y_up;
-        const L  = Math.hypot(dx, dy);
-        if (L < 1e-9) continue;
-        const c = dx / L, s = dy / L;
-        
-        let E = m.E || 0, A = m.A || 0, I = m.I || 0;
-        
-        if(modifiers && modifiers[m.id]){
-            E *= modifiers[m.id].E_fac;
-            A *= modifiers[m.id].A_fac;
-            I *= modifiers[m.id].I_fac;
-        }
-
-        if (!(E > 0 && A > 0 && I > 0)) continue;
-        const kLoc = frameLocalStiffness(E, A, I, L);
-        const T    = frameT(c, s);
-        const kG   = matMul6TKT(kLoc, T);
-        const baseI = dofMap.analysis[ni], baseJ = dofMap.analysis[nj];
-        const map   = [baseI, baseI+1, baseI+2, baseJ, baseJ+1, baseJ+2];
-        addToGlobalVar(K, kG, map);
-        geom[m.id] = { i: ni, j: nj, L, c, s, T };
-    }
-    return { N, dofMap, anodes, K, F, geom };
-  }
-
-  function generateSublines(build, U, divCount){
-      const sublines = [];
-      const { dofMap } = build; 
-      for (const m of members){
-          const niID = m.n1, njID = m.n2;
-          const bi = dofMap.primary[niID], bj = dofMap.primary[njID];
-          if(bi===undefined || bj===undefined) continue;
-          const nodeI = nodeById(niID), nodeJ = nodeById(njID);
-          const ui = { u: U[bi+0], v: U[bi+1] }, uj = { u: U[bj+0], v: U[bj+1] };
-          const poly = [];
-          for (let k=0; k<=divCount; k++){
-              const t=k/divCount;
-              const x_up = nodeI.x + t*(nodeJ.x-nodeI.x);
-              const y_up = yUp(nodeI.y + t*(nodeJ.y-nodeI.y)); 
-              poly.push({ x_up, y_up, u: ui.u*(1-t)+uj.u*t, v: ui.v*(1-t)+uj.v*t });
-          }
-          sublines.push(poly);
-      }
-      return sublines;
-  }
-
-  function computeInternalEndForces(build, U){
-    const { dofMap, geom } = build;
-    const internal = {};
-    for (const memIdStr of Object.keys(geom)){
-        const memId = parseInt(memIdStr, 10);
-        const gEl   = geom[memId];
-        if (!gEl) continue;
-        const m = memberById(memId);
-        if (!m) continue;
-        const E=m.E, A=m.A, I=m.I;
-        const bi = dofMap.analysis[gEl.i];
-        const bj = dofMap.analysis[gEl.j];
-        const ue = [ U[bi], U[bi+1], U[bi+2], U[bj], U[bj+1], U[bj+2] ];
-        const u_loc = mulMatVec(gEl.T, ue);
-        const kLoc = frameLocalStiffness(E, A, I, gEl.L);
-        const f_loc = mulMatVec(kLoc, u_loc); 
-        internal[memId] = { Ni: f_loc[0], Vi: f_loc[1], Mi: f_loc[2], Nj: f_loc[3], Vj: f_loc[4], Mj: f_loc[5] };
-    }
-    return internal;
-  }
-
   // ===== Helpers =====
-  function getAnalysisIdForPrimary(pid, anodes){ for (const [aid,obj] of Object.entries(anodes)){ if (obj.primary===pid) return parseInt(aid,10); } return null; }
-  function addToGlobalVar(K, ke, map){ for (let r=0;r<map.length;r++){ const R=map[r]; for (let c=0;c<map.length;c++){ const C=map[c]; K[R][C] += ke[r][c]; }}}
-  function matPick(A,r,c){ const M=r.length,N=c.length,O=Array(M); for(let i=0;i<M;i++){ O[i]=Array(N); for(let j=0;j<N;j++)O[i][j]=A[r[i]][c[j]]; } return O; }
-  function vecPick(v,r){ return r.map(i=>v[i]); }
-  function zeros(n,m){ const A=Array(n); for(let i=0;i<n;i++) if(m) A[i]=Array(m).fill(0); else A[i]=0; return A; }
-  function frameLocalStiffness(E,A,I,L){
-      const k=Array(6).fill(0).map(()=>Array(6).fill(0));
-      const a=E*A/L, b=12*E*I/(L*L*L), c=6*E*I/(L*L), d=4*E*I/L, e=2*E*I/L;
-      k[0][0]=a; k[0][3]=-a; k[3][3]=a; k[3][0]=-a;
-      k[1][1]=b; k[1][2]=c; k[1][4]=-b; k[1][5]=c;
-      k[2][1]=c; k[2][2]=d; k[2][4]=-c; k[2][5]=e;
-      k[4][1]=-b; k[4][2]=-c; k[4][4]=b; k[4][5]=-c;
-      k[5][1]=c; k[5][2]=e; k[5][4]=-c; k[5][5]=d;
-      return k;
+  function worldToScreen(wx, wy){
+    return { x: wx * view.scale + view.offsetX, y: wy * view.scale + view.offsetY };
   }
-  function frameT(c,s){ return [ [c,s,0,0,0,0], [-s,c,0,0,0,0], [0,0,1,0,0,0], [0,0,0,c,s,0], [0,0,0,-s,c,0], [0,0,0,0,0,1] ]; }
-  function matMul6TKT(k,T){ const KT=matMul(k,T); const TT=transpose(T); return matMul(TT,KT); }
-  function matMul(A,B){
-      const r=A.length, c=B[0].length, p=B.length;
-      const C=Array(r).fill(0).map(()=>Array(c).fill(0));
-      for(let i=0;i<r;i++) for(let j=0;j<c;j++) for(let k=0;k<p;k++) C[i][j]+=A[i][k]*B[k][j];
-      return C;
+  function screenToWorld(sx, sy){
+    return { x: (sx - view.offsetX) / view.scale, y: (sy - view.offsetY) / view.scale };
   }
-  function mulMatVec(M, v){
-    const n = M.length; const out = new Array(n).fill(0);
-    for (let i = 0; i < n; i++){ let sum = 0; const row = M[i]; for (let j = 0; j < row.length; j++) sum += row[j] * v[j]; out[i] = sum; }
-    return out;
+  function autoFitView(){
+    if (nodes.length === 0){ view.scale = 1; view.offsetX = 0; view.offsetY = 0; return; }
+    const bbox = modelBounds();
+    const w = bbox.w; const h = bbox.h;
+    if (!(w > 0) || !(h > 0)){ view.scale = 1; view.offsetX = 0; view.offsetY = 0; return; }
+    const sx = (base.width  * 0.8) / w;
+    const sy = (base.height * 0.8) / h;
+    let s = Math.min(sx, sy);
+    s = Math.max(MIN_SCALE, Math.min(MAX_SCALE, s));
+    view.scale = s;
+    const cx = bbox.x0 + w/2; const cy = bbox.y0 + h/2;
+    view.offsetX = base.width /2 - cx * view.scale;
+    view.offsetY = base.height/2 - cy * view.scale;
   }
-  function transpose(A){ return A[0].map((_,c)=>A.map(r=>r[c])); }
-  function round6(x){ return Math.round(x*1e6)/1e6; }
-  
-  function drawCoordTag(g, x, y, text){
-    g.save(); g.fillStyle='rgba(0,0,0,0.7)'; g.fillRect(x,y,80,16); g.fillStyle='#fff'; g.fillText(text,x+4,y+12); g.restore();
-  }
-  function modelBounds(){
-      if(nodes.length===0)return {x0:0,y0:0,w:100,h:100};
-      let x0=Infinity,x1=-Infinity,y0=Infinity,y1=-Infinity;
-      nodes.forEach(n=>{ x0=Math.min(x0,n.x); x1=Math.max(x1,n.x); y0=Math.min(y0,n.y); y1=Math.max(y1,n.y); });
-      return {x0,y0,w:x1-x0||1,h:y1-y0||1};
-  }
-  function refreshLists(){ 
-      nodeList.innerHTML = nodes.map(n=>`<div>N${n.id}</div>`).join('');
-      memberList.innerHTML = members.map(m=>`<div>M${m.id}: Fy=${m.Fy}</div>`).join('');
-  }
-  
-  function toggleStressPanel(show){
-    stressBlock.style.display = show ? 'block' : 'none';
-    document.getElementById('stressPanelHint').style.display = show ? 'block' : 'none';
-    if(show){ 
-        stressCanvas.style.width='100%'; stressCanvas.width=stressCanvas.parentElement.clientWidth; stressCanvas.height=260; 
-        if(selectedMemberId) plotStressPanel();
+  function autoFitIfNeeded(){ if (!view.userAdjusted) autoFitView(); }
+  const nearNodeId = (x,y, tolPx=9) => {
+    const tolWorld = tolPx / view.scale;
+    let best=null, dmin=tolWorld*tolWorld;
+    for (const n of nodes) {
+      const d = dist2(n.x, n.y, x, y);
+      if (d <= dmin){ best=n; dmin=d; }
     }
+    return best ? best.id : null;
+  };
+  const nodeById   = id => nodes.find(n=>n.id===id);
+  const memberById = id => members.find(m=>m.id===id);
+  const pointToSegmentDistance = (P, A, B) => {
+    const ABx=B.x-A.x, ABy=B.y-A.y, APx=P.x-A.x, APy=P.y-A.y;
+    const ab2 = ABx*ABx + ABy*ABy || 1e-9;
+    let t = (APx*ABx + APy*ABy)/ab2; 
+    t = Math.max(0,Math.min(1,t));
+    const Cx=A.x+t*(B.x-A.x), Cy=A.y+t*(B.y-A.y);
+    return Math.hypot(P.x-Cx, P.y-Cy);
+  };
+  const nearMemberId = (x,y, tolPx=6) => {
+    const tolWorld = tolPx / view.scale;
+    let bestId=null, best=tolWorld;
+    for (const m of members){
+      const a=nodeById(m.n1), b=nodeById(m.n2);
+      const d=pointToSegmentDistance({x,y},a,b);
+      if (d<best){best=d; bestId=m.id;}
+    }
+    return bestId;
+  };
+  function addNode(x,y){
+    const id=nextNodeId++;
+    nodes.push({ id,x,y, bc:'free', Fx:0,Fy:0,Mz:0, Kx:0,Ky:0,Kt:0, Wn:0 });
+    refreshLists(); return id;
   }
-  
+  function addMember(n1,n2){
+    if (members.length>=MAX_MEMBERS){ Swal.fire('Limit','Max members','info'); return null; }
+    const id=nextMemberId++;
+    let E=29000000, A=10, I=100, S=10, c=0, wd=0, Fy=36000, shapeF=1.15, label=`M${id}`;
+    if (members.length>=1){ const t = members[members.length-1]; ({E,A,I,S,c,wd,Fy,shapeF} = t); }
+    members.push({ id,n1,n2,E,A,I,S,c,wd, Fy, shapeF, label });
+    refreshLists(); return id;
+  }
+  function deleteMember(id){
+    const idx = members.findIndex(m=>m.id===id); if (idx<0) return;
+    members.splice(idx,1); lastSolution = null; collapseHistory=null; refreshLists(); autoFitIfNeeded(); draw();
+  }
+  function deleteNodeWithMembers(nodeId){
+    const nidx = nodes.findIndex(n=>n.id===nodeId); if (nidx<0) return;
+    members = members.filter(m => m.n1!==nodeId && m.n2!==nodeId);
+    nodes.splice(nidx,1); lastSolution = null; collapseHistory=null; refreshLists(); autoFitIfNeeded(); draw();
+  }
+  const yUp = yCanvas => base.height - yCanvas;
+  const yCanvas = yUpVal  => base.height - yUpVal;
+  function mousePos(e){
+    const r=overlay.getBoundingClientRect();
+    return { x:(e.clientX-r.left-view.offsetX)/view.scale, y:(e.clientY-r.top-view.offsetY)/view.scale, sx:e.clientX-r.left, sy:e.clientY-r.top };
+  }
+  function editNode(node){
+    const bcOptions = [
+      {value:'free', text:'Free'}, {value:'simple', text:'Pinned'}, {value:'fixed', text:'Fixed'},
+      {value:'rollerX', text:'Roller-X'}, {value:'rollerY', text:'Roller-Y'}
+    ];
+    const html = `
+      <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px;">
+        <label style="grid-column:1/3; font-weight:600;">BC</label>
+        <select id="bc" class="swal2-select" style="grid-column:1/3;">
+          ${bcOptions.map(o=>`<option value="${o.value}" ${node.bc===o.value?'selected':''}>${o.text}</option>`).join('')}
+        </select>
+        <label>Fx</label><input id="Fx" class="swal2-input" type="number" step="any" value="${node.Fx}">
+        <label>Fy</label><input id="Fy" class="swal2-input" type="number" step="any" value="${node.Fy}">
+        <label>Mz</label><input id="Mz" class="swal2-input" type="number" step="any" value="${node.Mz||0}">
+      </div>`;
+    Swal.fire({ title:`Node ${node.id}`, html, showCancelButton:true, confirmButtonText:'Save',
+      preConfirm:()=>{
+        const v=id=>parseFloat(document.getElementById(id).value)||0;
+        return { bc:document.getElementById('bc').value, Fx:v('Fx'), Fy:v('Fy'), Mz:v('Mz') };
+      }
+    }).then(res=>{ if(res.isConfirmed){ Object.assign(node,res.value); lastSolution=null; refreshLists(); draw(); } });
+  }
+  function editMember(m){
+    const html = `
+      <div style="display:grid; grid-template-columns: 1fr 1fr; gap:8px; align-items:center;">
+        <label>Label</label><input id="label" class="swal2-input" type="text" value="${m.label||''}">
+        <div style="grid-column:1/3;height:1px;background:#eee;margin:4px 0;"></div>
+        <label>E</label><input id="E" class="swal2-input" type="number" step="any" value="${m.E}">
+        <label>A</label><input id="A" class="swal2-input" type="number" step="any" value="${m.A}">
+        <label>I</label><input id="I" class="swal2-input" type="number" step="any" value="${m.I}">
+        <label>S (Section Mod)</label><input id="S" class="swal2-input" type="number" step="any" value="${m.S}">
+        <label>Fy (Yield Stress)</label><input id="Fy" class="swal2-input" type="number" step="any" value="${m.Fy||36000}">
+        <label>Shape Factor</label><input id="shapeF" class="swal2-input" type="number" step="any" value="${m.shapeF||1.15}">
+      </div>`;
+    Swal.fire({ title:`Member ${m.id}`, html, showCancelButton:true, confirmButtonText:'Save', width: '400px',
+      preConfirm:()=>{
+        const v=id=>parseFloat(document.getElementById(id)?.value)||0;
+        return { 
+            label:document.getElementById('label').value, 
+            E:v('E'), A:v('A'), I:v('I'), S:v('S'), Fy:v('Fy'), shapeF:v('shapeF') 
+        };
+      }
+    }).then(res=>{ if(res.isConfirmed){ Object.assign(m,res.value); lastSolution=null; refreshLists(); draw(); } });
+  }
   function plotStressPanel(){
       const spx = stressCanvas.getContext('2d');
       spx.clearRect(0,0,stressCanvas.width,stressCanvas.height);
@@ -859,14 +855,12 @@
       }
       const mData = lastSolution.stress[selectedMemberId];
       if(!mData) return;
-      
       const mode = document.getElementById('stressPlotMode').value;
       let arr = (mode==='sigma')?mData.sigmaTop : (mode==='N'?mData.N : (mode==='V'?mData.V : mData.M));
       let min=Infinity, max=-Infinity;
       for(let v of arr){ min=Math.min(min,v); max=Math.max(max,v); }
       if(!isFinite(min)) { min=-1; max=1; }
       if(max===min){ min-=1; max+=1; }
-      
       const W=stressCanvas.width, H=stressCanvas.height;
       spx.beginPath(); spx.strokeStyle='#000';
       for(let i=0; i<arr.length; i++){
@@ -878,22 +872,21 @@
       spx.fillText(`Max: ${max.toFixed(2)}`, 10, 15);
       spx.fillText(`Min: ${min.toFixed(2)}`, 10, H-5);
   }
-
+  if (stressPlotModeSelect){
+    stressPlotModeSelect.addEventListener('change', () => { if (viewMode === 'stresspanel') plotStressPanel(); });
+  }
   function drawBCGlyph(g, bc){
-    // Not used in main UI but required by editNode dialog if called
     g.clearRect(0,0,g.canvas.width,g.canvas.height);
-    g.save(); g.translate(30, g.canvas.height-20); g.strokeStyle='#aaa'; g.lineWidth=1;
+    g.save(); g.translate(30, g.canvas.height-20);
+    g.strokeStyle='#aaa'; g.lineWidth=1;
     g.beginPath(); g.moveTo(-10,0); g.lineTo(140,0); g.stroke();
     g.fillStyle='#000'; g.beginPath(); g.arc(0,0,4,0,Math.PI*2); g.fill();
     g.restore();
   }
-
   function draw(scaleOverride){
     ctx.clearRect(0,0,base.width,base.height);
     ovr.clearRect(0,0,overlay.width,overlay.height);
     drawGrid(ctx);
-    
-    // Members
     ctx.save(); ctx.lineWidth=2; ctx.strokeStyle='#222'; ctx.font='12px system-ui'; ctx.fillStyle='#000';
     for (const m of members){
       const a=nodeById(m.n1), b=nodeById(m.n2);
@@ -903,27 +896,21 @@
       ctx.fillText(m.label||`M${m.id}`, M.x+4, M.y-6);
     }
     ctx.restore();
-
-    // Nodes
     for (const n of nodes){
       const p=worldToScreen(n.x,n.y);
       ctx.save(); ctx.fillStyle='#000';
       if(n.bc==='fixed') ctx.fillRect(p.x-8,p.y-8,16,16);
       else if(n.bc==='simple'){ ctx.beginPath(); ctx.moveTo(p.x,p.y); ctx.lineTo(p.x-6,p.y+10); ctx.lineTo(p.x+6,p.y+10); ctx.fill(); }
-      
       ctx.fillStyle='#1d4ed8'; ctx.beginPath(); ctx.arc(p.x,p.y,4,0,Math.PI*2); ctx.fill();
-      
       ctx.strokeStyle='#db2777'; ctx.lineWidth=2;
       if(n.Fx){ ctx.beginPath(); ctx.moveTo(p.x,p.y); ctx.lineTo(p.x+30*(n.Fx>0?1:-1),p.y); ctx.stroke(); }
       if(n.Fy){ ctx.beginPath(); ctx.moveTo(p.x,p.y); ctx.lineTo(p.x,p.y+30*(n.Fy<0?1:-1)); ctx.stroke(); }
       ctx.restore();
       drawCoordTag(ctx, p.x+10, p.y-12, `(${n.x.toFixed(1)}, ${n.y.toFixed(1)})`);
     }
-    
     if(viewMode==='def' && lastSolution && lastSolution.sublines){
         let scale = parseFloat(document.getElementById('defScale').value)||1;
         if(scaleOverride !== undefined) scale = scaleOverride;
-        
         ctx.save(); ctx.lineWidth=2; ctx.strokeStyle='#e11d48';
         for(const poly of lastSolution.sublines){
             ctx.beginPath();
@@ -938,7 +925,6 @@
     }
     drawSelection();
   }
-
   function drawSelection(){
       if(selectedNodeId){
           const n=nodeById(selectedNodeId), p=worldToScreen(n.x,n.y);
@@ -950,18 +936,145 @@
           ovr.save(); ovr.lineWidth=4; ovr.strokeStyle='#f59e0b'; ovr.beginPath(); ovr.moveTo(A.x,A.y); ovr.lineTo(B.x,B.y); ovr.stroke(); ovr.restore();
       }
   }
-
   function drawGrid(g){
       g.save(); g.lineWidth=1; g.strokeStyle='#eee';
-      const bbox=modelBounds();
-      g.restore();
+      const bbox=modelBounds(); g.restore();
+  }
+  function drawCoordTag(g, x, y, text){
+    g.save(); g.fillStyle='rgba(0,0,0,0.7)'; g.fillRect(x,y,80,16); g.fillStyle='#fff'; g.fillText(text,x+4,y+12); g.restore();
+  }
+  function modelBounds(){
+      if(nodes.length===0)return {x0:0,y0:0,w:100,h:100};
+      let x0=Infinity,x1=-Infinity,y0=Infinity,y1=-Infinity;
+      nodes.forEach(n=>{ x0=Math.min(x0,n.x); x1=Math.max(x1,n.x); y0=Math.min(y0,n.y); y1=Math.max(y1,n.y); });
+      return {x0,y0,w:x1-x0||1,h:y1-y0||1};
+  }
+  function refreshLists(){ 
+      nodeList.innerHTML = nodes.map(n=>`<div>N${n.id}</div>`).join('');
+      memberList.innerHTML = members.map(m=>`<div>M${m.id}: Fy=${m.Fy}</div>`).join('');
   }
 
-  if (stressPlotModeSelect){
-    stressPlotModeSelect.addEventListener('change', () => {
-      if (viewMode === 'stresspanel') plotStressPanel();
-    });
-  }
+  // ===== Overlay Events (mousedown, mousemove, etc.) =====
+  overlay.addEventListener('contextmenu', e => e.preventDefault());
+  overlay.addEventListener('mousedown', (e)=>{
+    if (e.button === 2){
+      isPanning = true; panStart.sx = e.clientX; panStart.sy = e.clientY;
+      panStart.offsetX = view.offsetX; panStart.offsetY = view.offsetY;
+      view.userAdjusted = true; overlay.style.cursor = 'grab'; e.preventDefault(); return;
+    }
+    const {x,y}=mousePos(e);
+    if (mode==='draw'){
+      const nid=nearNodeId(x,y);
+      let startNode, created=false, existing=false;
+      if (nid){ startNode=nodeById(nid); existing=true; }
+      else { const id=addNode(x,y); startNode=nodeById(id); created=true; }
+      dragStart={x:startNode.x, y:startNode.y, nodeId:startNode.id, createdStart:created, existingStart:existing};
+      hoverEndNodeId=null;
+    } else if (mode==='select'){
+      const nid = nearNodeId(x,y,8);
+      if (nid){
+        const n = nodeById(nid); movingNodeId = nid;
+        moveOffset.dx = x - n.x; moveOffset.dy = y - n.y;
+        selectedNodeId = nid; overlay.style.cursor='grabbing';
+      }
+      dragStart={x,y,nodeId:null,createdStart:false}; hoverEndNodeId=null;
+    }
+    draw();
+  });
+  overlay.addEventListener('mousemove', (e)=>{
+    const {x,y,sx,sy}=mousePos(e);
+    if (isPanning){
+      view.offsetX = panStart.offsetX + (e.clientX - panStart.sx);
+      view.offsetY = panStart.offsetY + (e.clientY - panStart.sy);
+      view.userAdjusted = true; draw(); return;
+    }
+    if (mode==='draw' && dragStart){
+      hoverEndNodeId = nearNodeId(x,y);
+      draw();
+      const p0 = worldToScreen(dragStart.x, dragStart.y);
+      const p1 = worldToScreen(x, y);
+      ovr.save(); ovr.lineWidth=2; ovr.setLineDash([6,4]); ovr.strokeStyle='#3a86ff';
+      ovr.beginPath(); ovr.moveTo(p0.x,p0.y); ovr.lineTo(p1.x,p1.y); ovr.stroke();
+      drawCoordTag(ovr, sx, sy, `(${x.toFixed(1)}, ${y.toFixed(1)})`);
+      ovr.restore(); return;
+    }
+    draw();
+    if (mode==='select'){
+        if(movingNodeId!==null){
+            const n=nodeById(movingNodeId); n.x=x-moveOffset.dx; n.y=y-moveOffset.dy;
+            lastSolution=null; draw(); return;
+        }
+        const mid=nearMemberId(x,y,6);
+        const nid=nearNodeId(x,y,8);
+        if(mid){
+            const m=memberById(mid), a=nodeById(m.n1), b=nodeById(m.n2);
+            const A=worldToScreen(a.x,a.y), B=worldToScreen(b.x,b.y);
+            ovr.save(); ovr.lineWidth=4; ovr.strokeStyle='#ff006e';
+            ovr.beginPath(); ovr.moveTo(A.x,A.y); ovr.lineTo(B.x,B.y); ovr.stroke(); ovr.restore();
+            overlay.style.cursor='pointer';
+        } else if(nid){
+            const n=nodeById(nid), p=worldToScreen(n.x,n.y);
+            ovr.save(); ovr.fillStyle='rgba(16,185,129,0.22)';
+            ovr.beginPath(); ovr.arc(p.x,p.y,10,0,Math.PI*2); ovr.fill(); ovr.restore();
+            overlay.style.cursor='pointer';
+            drawCoordTag(ovr, p.x+12, p.y-12, `(${n.x.toFixed(1)}, ${n.y.toFixed(1)})`);
+        } else { overlay.style.cursor='pointer'; }
+    }
+  });
+  overlay.addEventListener('mouseup', (e)=>{
+    if (isPanning && e.button === 2){ isPanning = false; overlay.style.cursor = (mode === 'draw') ? 'crosshair' : 'pointer'; return; }
+    const {x,y}=mousePos(e);
+    if (mode==='draw' && dragStart){
+      let nid=nearNodeId(x,y);
+      let endNode;
+      if (nid){ endNode=nodeById(nid); } else { const id=addNode(x,y); endNode=nodeById(id); }
+      if (endNode.id===dragStart.nodeId){
+        if (dragStart.createdStart){ nodes.pop(); }
+        dragStart=null; refreshLists(); draw(); return;
+      }
+      const mid=addMember(dragStart.nodeId, endNode.id);
+      dragStart=null; refreshLists(); autoFitIfNeeded(); draw();
+      if (mid) editMember(memberById(mid));
+      return;
+    }
+    if (mode==='select'){
+      const mid=nearMemberId(x,y,6);
+      const nid=nearNodeId(x,y,8);
+      if (movingNodeId!==null){ movingNodeId=null; draw(); return; }
+      if (viewMode==='stresspanel' && mid){ selectedMemberId = mid; plotStressPanel(); return; }
+      if (nid){ selectedNodeId=nid; selectedMemberForDelete=null; draw(); return; }
+      if (mid){ selectedMemberForDelete=mid; selectedNodeId=null; draw(); return; }
+      selectedNodeId=null; selectedMemberForDelete=null; draw();
+    }
+  });
+  overlay.addEventListener('dblclick', (e)=>{
+    if (mode!=='select') return;
+    const {x,y}=mousePos(e);
+    const nid=nearNodeId(x,y,8);
+    const mid=nearMemberId(x,y,6);
+    if (nid){ editNode(nodeById(nid)); draw(); return; }
+    if (mid){ editMember(memberById(mid)); draw(); return; }
+  });
+  overlay.addEventListener('wheel', (e)=>{
+    e.preventDefault(); if(nodes.length===0)return;
+    const rect = overlay.getBoundingClientRect();
+    const sx = e.clientX - rect.left; const sy = e.clientY - rect.top;
+    const world = screenToWorld(sx,sy);
+    const delta = e.deltaY < 0 ? 1.1 : 0.9;
+    let newScale = view.scale * delta;
+    newScale = Math.max(MIN_SCALE, Math.min(MAX_SCALE, newScale));
+    view.scale = newScale;
+    view.offsetX = sx - world.x * view.scale;
+    view.offsetY = sy - world.y * view.scale;
+    view.userAdjusted = true; draw();
+  }, { passive:false });
+  document.addEventListener('keydown', (e)=>{
+    if (mode!=='select') return;
+    if (e.key==='Delete' || e.key==='Backspace'){
+      if (selectedNodeId){ deleteNodeWithMembers(selectedNodeId); selectedNodeId=null; e.preventDefault(); }
+      else if (selectedMemberForDelete){ deleteMember(selectedMemberForDelete); selectedMemberForDelete=null; e.preventDefault(); }
+    }
+  });
 
   // Kickoff
   refreshLists();
