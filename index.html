@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8" />
-<title>Frame Collapse — Fixed Layout</title>
+<title>Frame Collapse — Complete</title>
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/numeric/1.2.6/numeric.min.js"></script>
@@ -21,25 +21,21 @@
   button.action  { background:#e0f2fe; color:#0369a1; border-color:#7dd3fc; font-weight:600; }
   button.active  { background:#94a3b8; color:#fff; cursor:default; }
   
-  /* --- CANVAS LAYOUT FIX --- */
+  /* --- LAYOUT FIXES --- */
   #wrap { position:relative; width:var(--canvas-w); height:var(--canvas-h); background:#fff; border:1px solid #ccc; }
-  /* Only main viewport canvases are absolute */
-  #wrap canvas { position:absolute; inset:0; } 
+  
+  /* Only the main drawing canvases are absolute */
+  #base, #overlay { position:absolute; inset:0; } 
   #base { z-index:1; } 
   #overlay { z-index:2; cursor:crosshair; }
   
-  /* Chart canvases should be normal block elements */
-  #loadVsStepCanvas, #loadVsDispCanvas, #stressPanel { 
-      display: block; 
-      position: static; 
-      background: #f9fafb; 
-      border: 1px solid #ddd; 
-      border-radius: 4px;
-  }
+  /* Chart canvases are standard block elements */
+  canvas.chart { display: block; background: #f9fafb; border: 1px solid #ddd; border-radius: 4px; margin-bottom: 8px; }
 
   .list { font-size:13px; max-height:240px; overflow:auto; border:1px dashed #ddd; padding:8px; margin-top:10px;}
   .node-row { display:grid; grid-template-columns: 50px 1fr 1fr 30px; gap:4px; margin-bottom:4px; }
-  #stressPanelBlock { display:none; margin-top:10px; border:1px solid #ccc; padding:10px; }
+  
+  #stressPanelBlock { display:none; margin-top:10px; border:1px solid #ccc; padding:10px; border-radius: 8px;}
   #loadPlotBlock { display:none; margin-top:10px; padding:10px; border:1px solid #eee; background:#fafafa; border-radius:8px; }
 </style>
 </head>
@@ -77,6 +73,7 @@
         
         <button id="viewStressPanel">Stresses</button>
         <button id="btnResetView">Reset</button>
+        <button id="btnFitView">Fit View</button>
       </div>
     </div>
 
@@ -103,8 +100,8 @@
         
         <div id="loadPlotBlock">
             <div style="font-weight:bold; margin-bottom:5px;">Load History</div>
-            <canvas id="loadVsStepCanvas" width="350" height="120" style="margin-bottom:8px;"></canvas>
-            <canvas id="loadVsDispCanvas" width="350" height="120"></canvas>
+            <canvas id="loadVsStepCanvas" class="chart" width="350" height="120"></canvas>
+            <canvas id="loadVsDispCanvas" class="chart" width="350" height="120"></canvas>
         </div>
       </div>
 
@@ -118,7 +115,7 @@
           </select>
           <button id="btnCloseStressPanel">Close</button>
         </div>
-        <canvas id="stressPanel" height="200"></canvas>
+        <canvas id="stressPanel" height="200" style="width:100%;"></canvas>
         <div id="stressPanelHint" style="font-size:11px; color:#666;">Click a member to plot.</div>
       </div>
     </div>
@@ -126,14 +123,13 @@
 
 <script>
 // ==========================================
-// 1. GLOBAL STATE (Defined First)
+// 1. GLOBAL STATE
 // ==========================================
 const base = document.getElementById('base');
 const overlay = document.getElementById('overlay');
 const ctx = base.getContext('2d');
 const ovr = overlay.getContext('2d');
 const stressCanvas = document.getElementById('stressPanel');
-const spx = stressCanvas.getContext('2d');
 
 let nodes = [];
 let members = [];
@@ -156,33 +152,16 @@ let movingNodeId = null;
 let moveOffset = {dx:0, dy:0};
 
 // ==========================================
-// 2. HELPER FUNCTIONS (MATH & SOLVER)
+// 2. MATH & SOLVER HELPERS
 // ==========================================
 
-function zeros(n,m){ 
-    const A=Array(n); for(let i=0;i<n;i++) if(m) A[i]=Array(m).fill(0); else A[i]=0; return A; 
-}
-function matPick(A,r,c){ 
-    const M=r.length,N=c.length,O=Array(M); 
-    for(let i=0;i<M;i++){ O[i]=Array(N); for(let j=0;j<N;j++)O[i][j]=A[r[i]][c[j]]; } 
-    return O; 
-}
+function zeros(n,m){ const A=Array(n); for(let i=0;i<n;i++) if(m) A[i]=Array(m).fill(0); else A[i]=0; return A; }
+function matPick(A,r,c){ const M=r.length,N=c.length,O=Array(M); for(let i=0;i<M;i++){ O[i]=Array(N); for(let j=0;j<N;j++)O[i][j]=A[r[i]][c[j]]; } return O; }
 function vecPick(v,r){ return r.map(i=>v[i]); }
-function mulMatVec(M, v){
-    const n = M.length; const out = new Array(n).fill(0);
-    for (let i = 0; i < n; i++){ let sum = 0; const row = M[i]; for (let j = 0; j < row.length; j++) sum += row[j] * v[j]; out[i] = sum; }
-    return out;
-}
-function matMul(A,B){
-    const r=A.length, c=B[0].length, p=B.length;
-    const C=Array(r).fill(0).map(()=>Array(c).fill(0));
-    for(let i=0;i<r;i++) for(let j=0;j<c;j++) for(let k=0;k<p;k++) C[i][j]+=A[i][k]*B[k][j];
-    return C;
-}
+function mulMatVec(M, v){ const n = M.length; const out = new Array(n).fill(0); for (let i = 0; i < n; i++){ let sum = 0; const row = M[i]; for (let j = 0; j < row.length; j++) sum += row[j] * v[j]; out[i] = sum; } return out; }
+function matMul(A,B){ const r=A.length, c=B[0].length, p=B.length; const C=Array(r).fill(0).map(()=>Array(c).fill(0)); for(let i=0;i<r;i++) for(let j=0;j<c;j++) for(let k=0;k<p;k++) C[i][j]+=A[i][k]*B[k][j]; return C; }
 function transpose(A){ return A[0].map((_,c)=>A.map(r=>r[c])); }
-function frameT(c,s){ 
-    return [ [c,s,0,0,0,0], [-s,c,0,0,0,0], [0,0,1,0,0,0], [0,0,0,c,s,0], [0,0,0,-s,c,0], [0,0,0,0,0,1] ]; 
-}
+function frameT(c,s){ return [ [c,s,0,0,0,0], [-s,c,0,0,0,0], [0,0,1,0,0,0], [0,0,0,c,s,0], [0,0,0,-s,c,0], [0,0,0,0,0,1] ]; }
 function frameLocalStiffness(E,A,I,L){
     const k=Array(6).fill(0).map(()=>Array(6).fill(0));
     const a=E*A/L, b=12*E*I/(L*L*L), c=6*E*I/(L*L), d=4*E*I/L, e=2*E*I/L;
@@ -193,18 +172,12 @@ function frameLocalStiffness(E,A,I,L){
     k[5][1]=c; k[5][2]=e; k[5][4]=-c; k[5][5]=d;
     return k;
 }
-function matMul6TKT(k,T){ 
-    const KT=matMul(k,T); const TT=transpose(T); return matMul(TT,KT); 
-}
-function addToGlobalVar(K, ke, map){ 
-    for (let r=0;r<map.length;r++){ const R=map[r]; for (let c=0;c<map.length;c++){ const C=map[c]; K[R][C] += ke[r][c]; }}
-}
-function getAnalysisIdForPrimary(pid, anodes){ 
-    for (const [aid,obj] of Object.entries(anodes)){ if (obj.primary===pid) return parseInt(aid,10); } return null; 
-}
+function matMul6TKT(k,T){ const KT=matMul(k,T); const TT=transpose(T); return matMul(TT,KT); }
+function addToGlobalVar(K, ke, map){ for (let r=0;r<map.length;r++){ const R=map[r]; for (let c=0;c<map.length;c++){ const C=map[c]; K[R][C] += ke[r][c]; }}}
+function getAnalysisIdForPrimary(pid, anodes){ for (const [aid,obj] of Object.entries(anodes)){ if (obj.primary===pid) return parseInt(aid,10); } return null; }
 const yUp = y => base.height - y;
 
-// --- CORE SOLVER ---
+// --- SOLVER KERNEL ---
 function buildAnalysisModelFrame(modifiers = null){
     const anodes = {};
     const dofMap = { primary:{}, analysis:{} };
@@ -298,14 +271,12 @@ function solveFrameInternal(stiffMod = null){
     const build = buildAnalysisModelFrame(stiffMod);
     const { N, dofMap, K, F, geom } = build;
     
-    // Loads
     for (const n of nodes){
         const base = dofMap.primary[n.id];
         if (base === undefined) continue;
         F[base+0] += n.Fx || 0; F[base+1] += n.Fy || 0; F[base+2] += n.Mz || 0;
     }
     
-    // BCs
     const constrained = new Set();
     for (const n of nodes){
         const base = dofMap.primary[n.id];
@@ -366,7 +337,7 @@ function solveFrameInternal(stiffMod = null){
 }
 
 // ==========================================
-// 3. UI HANDLERS 
+// 3. UI & GRAPHICS HANDLERS
 // ==========================================
 
 function draw(){
@@ -410,7 +381,6 @@ function draw(){
     if(viewMode==='def' && lastSolution && lastSolution.sublines){
         let scale = parseFloat(document.getElementById('defScale').value)||1;
         ctx.save(); ctx.lineWidth=2; ctx.strokeStyle='#e11d48';
-        const yUp = y => base.height - y;
         for(const poly of lastSolution.sublines){
             ctx.beginPath();
             for(let k=0; k<poly.length; k++){
@@ -461,7 +431,7 @@ function plotLoadAnalysis(){
     const maxDisps = collapseHistory.map(h => h.U ? Math.max(...h.U.map(Math.abs)) : 0);
     
     // Plot 1: Lambda vs Step
-    ctx1.clearRect(0,0,cvs1.width,cvs1.height); ctx1.fillStyle='#f9fafb'; ctx1.fillRect(0,0,cvs1.width,cvs1.height);
+    ctx1.clearRect(0,0,cvs1.width,cvs1.height); 
     const maxL = Math.max(...lambdas);
     ctx1.beginPath(); ctx1.strokeStyle='#3b82f6'; ctx1.lineWidth=2;
     for(let i=0; i<lambdas.length; i++){
@@ -472,7 +442,7 @@ function plotLoadAnalysis(){
     ctx1.stroke();
     
     // Plot 2: Lambda vs Disp
-    ctx2.clearRect(0,0,cvs2.width,cvs2.height); ctx2.fillStyle='#f9fafb'; ctx2.fillRect(0,0,cvs2.width,cvs2.height);
+    ctx2.clearRect(0,0,cvs2.width,cvs2.height); 
     const maxD = Math.max(...maxDisps);
     ctx2.beginPath(); ctx2.strokeStyle='#10b981'; ctx2.lineWidth=2;
     for(let i=0; i<maxDisps.length; i++){
@@ -482,13 +452,75 @@ function plotLoadAnalysis(){
     }
     ctx2.stroke();
     
-    ctx1.fillStyle='#000'; ctx1.fillText(`Max λ: ${maxL.toFixed(2)}`, 20, 15);
-    ctx2.fillStyle='#000'; ctx2.fillText(`Max Disp: ${maxD.toFixed(2)}`, 20, 15);
+    ctx1.fillStyle='#000'; ctx1.font='10px sans-serif'; ctx1.fillText(`Max λ: ${maxL.toFixed(2)}`, 20, 15);
+    ctx2.fillStyle='#000'; ctx2.font='10px sans-serif'; ctx2.fillText(`Max Disp: ${maxD.toFixed(2)}`, 20, 15);
+}
+
+function plotStressPanel(){
+    const spx = stressCanvas.getContext('2d');
+    spx.clearRect(0,0,stressCanvas.width,stressCanvas.height);
+    if (!lastSolution || !lastSolution.stress || !selectedMemberId){
+        spx.fillText('Select member',10,20); return;
+    }
+    const mData = lastSolution.stress[selectedMemberId];
+    if(!mData) return;
+    const mode = document.getElementById('stressPlotMode').value;
+    let arr = (mode==='sigma')?mData.sigmaTop : (mode==='N'?mData.N : (mode==='V'?mData.V : mData.M));
+    let min=Infinity, max=-Infinity;
+    for(let v of arr){ min=Math.min(min,v); max=Math.max(max,v); }
+    if(!isFinite(min)) { min=-1; max=1; }
+    if(max===min){ min-=1; max+=1; }
+    
+    const W=stressCanvas.width, H=stressCanvas.height;
+    spx.beginPath(); spx.strokeStyle='#000';
+    for(let i=0; i<arr.length; i++){
+        const x = (i/(arr.length-1))*W;
+        const y = H - ((arr[i]-min)/(max-min))*(H-20) - 10;
+        if(i===0) spx.moveTo(x,y); else spx.lineTo(x,y);
+    }
+    spx.stroke();
+    spx.fillText(`Max: ${max.toFixed(2)}`, 10, 15);
+    spx.fillText(`Min: ${min.toFixed(2)}`, 10, H-5);
 }
 
 function refreshLists(){
     document.getElementById('nodeList').innerHTML = nodes.map(n=>`<div class="node-row">N${n.id}</div>`).join('');
     document.getElementById('memberList').innerHTML = members.map(m=>`<div class="node-row">M${m.id}</div>`).join('');
+}
+
+function autoFitView(){
+    if (nodes.length === 0){ view.scale = 1; view.offsetX = 0; view.offsetY = 0; return; }
+    const bbox = modelBounds();
+    const w = bbox.w; const h = bbox.h;
+    if (!(w > 0) || !(h > 0)){ view.scale = 1; view.offsetX = 0; view.offsetY = 0; return; }
+    const sx = (base.width  * 0.8) / w;
+    const sy = (base.height * 0.8) / h;
+    let s = Math.min(sx, sy);
+    s = Math.max(MIN_SCALE, Math.min(MAX_SCALE, s));
+    view.scale = s;
+    const cx = bbox.x0 + w/2; const cy = bbox.y0 + h/2;
+    view.offsetX = base.width /2 - cx * view.scale;
+    view.offsetY = base.height/2 - cy * view.scale;
+}
+function modelBounds(){
+    if(nodes.length===0)return {x0:0,y0:0,w:100,h:100};
+    let x0=Infinity,x1=-Infinity,y0=Infinity,y1=-Infinity;
+    nodes.forEach(n=>{ x0=Math.min(x0,n.x); x1=Math.max(x1,n.x); y0=Math.min(y0,n.y); y1=Math.max(y1,n.y); });
+    return {x0,y0,w:x1-x0||1,h:y1-y0||1};
+}
+function mousePos(e){
+    const r=overlay.getBoundingClientRect();
+    return { x:(e.clientX-r.left-view.offsetX)/view.scale, y:(e.clientY-r.top-view.offsetY)/view.scale, sx:e.clientX-r.left, sy:e.clientY-r.top };
+}
+function setActiveGroup(group, activeId) {
+    group.forEach(id => {
+      const btn = document.getElementById(id);
+      if (btn) btn.classList.toggle('active', id === activeId);
+    });
+}
+function toggleStressPanel(show){
+    document.getElementById('stressPanelBlock').style.display = show ? 'block' : 'none';
+    if(show && selectedMemberId) plotStressPanel();
 }
 
 // --- BUTTONS ---
@@ -596,7 +628,7 @@ document.getElementById('btnAnimate').onclick = () => {
         } else {
             const t=(ts-anim.t0)/1000;
             const base=parseFloat(document.getElementById('defScale').value)||1;
-            draw(base * 0.5*(1-Math.cos(2*Math.PI*t)));
+            draw(base * 0.5*(1-Math.cos(2*Math.PI*1*t)));
         }
         requestAnimationFrame(tick);
     };
@@ -606,6 +638,7 @@ document.getElementById('btnAnimate').onclick = () => {
 document.getElementById('btnDraw').onclick = () => { mode='draw'; };
 document.getElementById('btnSelect').onclick = () => { mode='select'; };
 document.getElementById('btnClear').onclick = () => { nodes=[]; members=[]; draw(); refreshLists(); };
+document.getElementById('btnFitView').onclick = () => { autoFitView(); view.userAdjusted=true; draw(); };
 
 // Overlay Helpers
 overlay.onmousedown = e => {
