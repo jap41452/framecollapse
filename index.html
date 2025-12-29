@@ -1252,6 +1252,26 @@ if (lastSolution && lastSolution.sublines){
     drawSelection();
   }
 
+// Draw-mode preview line (so it survives any redraw while dragging)
+if (mode === 'draw' && dragStart) {
+  // Use last known mouse world position if available
+  if (draw._mx !== undefined && draw._my !== undefined) {
+    const p0 = worldToScreen(dragStart.x, dragStart.y);
+    const p1 = worldToScreen(draw._mx, draw._my);
+
+    ovr.save();
+    ovr.lineWidth = 2;
+    ovr.setLineDash([6,4]);
+    ovr.strokeStyle = '#3a86ff';
+    ovr.beginPath();
+    ovr.moveTo(p0.x, p0.y);
+    ovr.lineTo(p1.x, p1.y);
+    ovr.stroke();
+    ovr.restore();
+  }
+}
+
+
   function drawSelection(){
     if(selectedNodeId){
       const n=nodeById(selectedNodeId); if(n){
@@ -1330,15 +1350,23 @@ if (lastSolution && lastSolution.sublines){
       view.offsetY = panStart.offsetY + (e.clientY - panStart.sy);
       view.userAdjusted = true; draw(); return;
     }
+
+// Store last mouse position for preview line drawn inside draw()
+draw._mx = x;
+draw._my = y;
+
+
     if (mode==='draw' && dragStart){
       hoverEndNodeId = nearNodeId(x,y);
       draw();
-      const p0 = worldToScreen(dragStart.x, dragStart.y);
-      const p1 = worldToScreen(x, y);
-      ovr.save(); ovr.lineWidth=2; ovr.setLineDash([6,4]); ovr.strokeStyle='#3a86ff';
-      ovr.beginPath(); ovr.moveTo(p0.x,p0.y); ovr.lineTo(p1.x,p1.y); ovr.stroke();
-      drawCoordTag(ovr, sx, sy, `(${x.toFixed(1)}, ${y.toFixed(1)})`);
-      ovr.restore(); return;
+
+if (mode === 'draw' && dragStart) {
+  hoverEndNodeId = nearNodeId(x,y);
+  draw();
+  return;
+}
+
+
     }
     draw();
     if (mode==='select'){
@@ -1414,13 +1442,43 @@ if (lastSolution && lastSolution.sublines){
     view.userAdjusted = true; draw();
   }, { passive:false });
 
-  document.addEventListener('keydown', (e)=>{
-    if (mode!=='select') return;
-    if (e.key==='Delete' || e.key==='Backspace'){
-      if (selectedNodeId){ deleteNodeWithMembers(selectedNodeId); selectedNodeId=null; e.preventDefault(); }
-      else if (selectedMemberForDelete){ deleteMember(selectedMemberForDelete); selectedMemberForDelete=null; e.preventDefault(); }
+
+
+document.addEventListener('keydown', (e) => {
+  // Only handle hotkeys in select mode
+  if (mode !== 'select') return;
+
+  // Do NOT treat Delete/Backspace as "delete geometry" when the user is typing
+  const t = e.target;
+  const isTypingContext =
+    t && (
+      t.tagName === 'INPUT' ||
+      t.tagName === 'TEXTAREA' ||
+      t.tagName === 'SELECT' ||
+      t.isContentEditable
+    );
+
+  // Also ignore when SweetAlert is open (it uses inputs)
+  const swalOpen = !!document.querySelector('.swal2-container');
+
+  if (isTypingContext || swalOpen) return;
+
+  if (e.key === 'Delete' || e.key === 'Backspace') {
+    if (selectedNodeId) {
+      deleteNodeWithMembers(selectedNodeId);
+      selectedNodeId = null;
+      e.preventDefault();
+    } else if (selectedMemberForDelete) {
+      deleteMember(selectedMemberForDelete);
+      selectedMemberForDelete = null;
+      e.preventDefault();
     }
-  });
+  }
+});
+
+
+
+
 
   // Kickoff
   view.scale = 1;
@@ -1437,4 +1495,5 @@ if (lastSolution && lastSolution.sublines){
 </script>
 </body>
 </html>
+
 
