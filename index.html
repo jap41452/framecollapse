@@ -541,7 +541,7 @@
   });
 
   overlay.addEventListener('mouseup', (e)=>{
-    if (isPanning && e.button === 2){ isPanning = false; overlay.style.cursor = (mode==='draw')?'crosshair':'pointer'; return; }
+    if (isPanning && e.button === 2){ isPanning = false; overlay.style.cursor = (mode === 'draw') ? 'crosshair' : 'pointer'; return; }
     const {x,y}=mousePos(e);
     if (mode==='draw' && dragStart){
       let nid=nearNodeId(x,y);
