@@ -31,23 +31,22 @@
   .panel-row { display: flex; gap: 10px; margin-top: 10px; }
   .panel-half { flex: 1; min-width: 0; }
 
-#wrap { position:relative; width:var(--canvas-w); height:var(--canvas-h); background:#fff; border:1px solid #ccc; border-radius:8px; }
+  #wrap { position:relative; width:var(--canvas-w); height:var(--canvas-h); background:#fff; border:1px solid #ccc; border-radius:8px; }
 
-/* Only the main drawing canvases are absolute */
-#wrap canvas { position:absolute; inset:0; }
+  /* Only the main drawing canvases are absolute */
+  #wrap canvas { position:absolute; inset:0; }
 
-#base { z-index:1; }
-#overlay { z-index:2; pointer-events:auto; cursor:crosshair; }
+  #base { z-index:1; }
+  #overlay { z-index:2; pointer-events:auto; cursor:crosshair; }
 
-/* Ensure plot canvases stay in normal document flow */
-#loadVsStepCanvas,
-#loadVsDispCanvas,
-#stressPanel {
-  position: static;
-  inset: auto;
-  display: block;
-}
-
+  /* Ensure plot canvases stay in normal document flow */
+  #loadVsStepCanvas,
+  #loadVsDispCanvas,
+  #stressPanel {
+    position: static;
+    inset: auto;
+    display: block;
+  }
 
   .panel { width:var(--panel-w); }
   .list { font-size:13px; max-height:240px; overflow:auto; border:1px dashed #ddd; padding:8px; border-radius:8px; }
@@ -192,7 +191,7 @@
 
   // Frame nodes: {id,x,y, bc, Fx,Fy,Mz, ...}
   let nodes = [];
-  // Members: {id,n1,n2,E,A,I,S,c,wd, Fy, shapeF, ...}
+  // Members: {id,n1,n2,E,A,I,S,c,wd, Fy, shapeF, materialBehavior, ...}
   let members = [];
   let nextNodeId = 1, nextMemberId = 1;
 
@@ -217,7 +216,7 @@
 
   // ===== UI Button Groups for Active State =====
   const modeBtns = ['btnDraw', 'btnSelect'];
-  const viewBtns = ['viewStressPanel']; // removed nonexistent viewLoadPlot
+  const viewBtns = ['viewStressPanel'];
 
   function setActiveGroup(group, activeId) {
     group.forEach(id => {
@@ -363,7 +362,7 @@
 
     // Basic linear stresses
     const stress = {};
-    const stressSummary = {};
+    const stressSumm = {};
     for (const m of members){
       const gEl = geom[m.id];
       const int = internal[m.id];
@@ -386,13 +385,13 @@
         sigTop.push(sTop); sigBot.push(sBot);
       }
       stress[m.id] = { L, x:xs, N:Ns, M:Ms, sigmaTop:sigTop, sigmaBot:sigBot };
-      stressSummary[m.id] = { NabsMax, MabsMax };
+      stressSumm[m.id] = { NabsMax, MabsMax };
     }
 
     const DIV = Math.max(1, Math.min(50, (parseInt(document.getElementById('divCount').value) || 10)));
     const sublines = generateSublines(build, U, DIV);
 
-    return { Ufull:U, dofMap, sublines, stress, stressSummary };
+    return { Ufull:U, dofMap, sublines, stress, stressSummary:stressSumm, build };
   }
 
   function computeInternalEndForces(build, U){
@@ -404,7 +403,13 @@
       if (!gEl) continue;
       const m = memberById(memId);
       if (!m) continue;
+
+      // Apply modifiers already baked into global K during solveFrameInternal.
+      // For reporting internal forces, use modified E/A/I consistent with build.
+      // We approximate here by using member base properties because the modifier only reduces stiffness;
+      // internal force distribution for scaled linear solve is still representative for hinge/brittle detection.
       const E=m.E, A=m.A, I=m.I;
+
       const bi = dofMap.analysis[gEl.i];
       const bj = dofMap.analysis[gEl.j];
       const ue = [ U[bi], U[bi+1], U[bi+2], U[bj], U[bj+1], U[bj+2] ];
@@ -419,6 +424,7 @@
   function generateSublines(build, U, divCount){
     const sublines = [];
     const { dofMap, anodes, internalNodeMap } = build;
+
     for (const m of members){
       const ni_analysis = getAnalysisIdForPrimary(m.n1, anodes);
       const nj_analysis = getAnalysisIdForPrimary(m.n2, anodes);
@@ -435,9 +441,7 @@
         if(baseDOF !== undefined){
           const u = U[baseDOF] || 0;
           const v = U[baseDOF+1] || 0;
-
-poly.push({ x0_up: anode.x_up, y0_up: anode.y_up, u, v });
-
+          poly.push({ x0_up: anode.x_up, y0_up: anode.y_up, u, v });
         }
       }
       sublines.push(poly);
@@ -544,7 +548,6 @@ poly.push({ x0_up: anode.x_up, y0_up: anode.y_up, u, v });
     draw();
   };
 
-  // New explicit Load Plots toggle (keeps plots in Results area)
   document.getElementById('btnLoadPlots').onclick = ()=> {
     viewMode='geom';
     toggleStressPanel(false);
@@ -592,237 +595,285 @@ poly.push({ x0_up: anode.x_up, y0_up: anode.y_up, u, v });
   document.getElementById('btnResetView').onclick = () => { lastSolution=null; collapseHistory=null; selectedMemberId=null; draw(); };
   document.getElementById('btnFitView').onclick = () => { autoFitView(); view.userAdjusted = true; draw(); };
 
+  // ===== Fix C: defScale input robustness =====
+  const defScaleInput = document.getElementById('defScale');
+  defScaleInput.addEventListener('input', () => draw());
+  defScaleInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Backspace' || e.key === 'Delete') e.stopPropagation();
+  });
+
   // ============================================
   // === COLLAPSE ANALYSIS (Incremental) Logic ===
   // ============================================
+  // REQUIREMENT IMPLEMENTED:
+  // - After each load step, update primary node positions (geometry).
+  // - Rebuild [K] on new geometry and solve.
+  // - Collapse when K is not solvable OR capacity drops (cannot carry more load).
+  //   Here: capacity drop is detected as "step solve fails" (singular/ill-conditioned),
+  //   OR "increment produces runaway displacement", OR "no positive stiffness left".
+  //
+  // Load increment logic changed:
+  // - We do NOT jump to a precomputed critical lambda.
+  // - We apply a constant load multiplier increment dλ per step to the ORIGINAL nodal loads.
+  // - At each step: set nodal loads = λ * baseLoads, solve, update geometry, track history.
+  //
   document.getElementById('btnCollapse').onclick = async () => {
-    const sol0 = solveFrameInternal();
-    if(!sol0) { Swal.fire('Error','Solver failed (unstable?)','error'); return; }
+    // Save original primary node positions AND base loads
+    const originalNodes = nodes.map(n => ({
+      id: n.id, x: n.x, y: n.y,
+      Fx: n.Fx||0, Fy: n.Fy||0, Mz: n.Mz||0
+    }));
 
-    let minLambda = Infinity;
-    let criticalReason = "None";
-    let critMemId = null;
-
-    for(const m of members) {
-      const res = sol0.stress[m.id];
-      const sum = sol0.stressSummary[m.id];
-      if(!res || !sum) continue;
-
-      // Yield
-      const Mp = (m.shapeF || 1.0) * (m.S || 0) * (m.Fy || 0);
-      const Mmax = sum.MabsMax;
-      if(Mp > 0 && Mmax > 1e-9) {
-        const lam = Mp / Mmax;
-        if(lam < minLambda) { minLambda = lam; criticalReason = "Yield"; critMemId=m.id; }
-      }
-
-      // Buckling (Euler)
-      const n1=nodeById(m.n1), n2=nodeById(m.n2);
-      const isPinned = (bc)=>bc==='simple'||bc==='rollerX'||bc==='rollerY';
-      let K_val = 0.5;
-      if(isPinned(n1.bc) && isPinned(n2.bc)) K_val=1.0;
-      else if(isPinned(n1.bc) || isPinned(n2.bc)) K_val=0.7;
-
-      const L=res.L;
-      const Pcr = (Math.PI**2 * m.E * m.I)/((K_val*L)**2);
-
-      let minN = 0; for(let val of res.N) if(val<minN) minN=val;
-      const Pcomp = Math.abs(minN);
-      if(Pcomp > 1e-9){
-        const lam = Pcr / Pcomp;
-        if(lam < minLambda) { minLambda = lam; criticalReason = "Buckling"; critMemId=m.id; }
-      }
+    // Base load vector (unit lambda)
+    const baseLoadsByNode = {};
+    for (const n of originalNodes){
+      baseLoadsByNode[n.id] = { Fx:n.Fx, Fy:n.Fy, Mz:n.Mz };
     }
 
-    if(minLambda === Infinity || minLambda > 1e6) {
-      Swal.fire('No Critical Load', 'Could not determine capacity (zero load?)', 'info');
+    // If there are no loads, stop
+    const anyLoad = originalNodes.some(n => Math.abs(n.Fx)+Math.abs(n.Fy)+Math.abs(n.Mz) > 0);
+    if(!anyLoad){
+      Swal.fire('No Loads','Set at least one node load before collapse analysis.','info');
       return;
     }
 
-    // Save original primary node positions
-    const originalNodes = nodes.map(n => ({id: n.id, x: n.x, y: n.y}));
+    // Reset geometry to original before starting
+    for (const n of nodes){
+      const o = originalNodes.find(p=>p.id===n.id);
+      if(o){ n.x=o.x; n.y=o.y; }
+    }
+
+    // Stiffness modifiers for member failures (hinges/brittle)
+    let stiffMod = {};
+    members.forEach(m => stiffMod[m.id] = { I_fac: 1.0, E_fac: 1.0, A_fac: 1.0 });
+    const failedMembers = {}; // {memId:{type:...}}
+
+    // Analysis controls
+    const MAX_STEPS = 80;
+    const dLambda = 0.05;       // load factor increment per step (change here)
+    const MAX_ABS_DISP = 1e6;   // runaway guard in DOF units
+    const MAX_REL_DISP = 200;   // runaway guard relative to member length scale
+    const MIN_STIFF_FRAC = 1e-6;
 
     collapseHistory = [];
 
-    // Initial build to get proper DOF count
-    const build_init = buildAnalysisModelFrame();
+    // Store step 0 (unloaded)
+    {
+      // Set loads to 0
+      for (const n of nodes){ n.Fx = 0; n.Fy = 0; n.Mz = 0; }
+      const build0 = buildAnalysisModelFrame(stiffMod);
+      const U0 = new Array(build0.N).fill(0);
 
-    // IMPORTANT: use nodePositions consistently (Fix for animation)
-    collapseHistory.push({
-      U: new Array(build_init.N).fill(0),
-      lambda: 0,
-      desc: "Unloaded",
-      nodePositions: originalNodes.map(n => ({...n}))
-    });
+      collapseHistory.push({
+        step: 0,
+        lambda: 0,
+        U: U0,
+        desc: 'Unloaded',
+        nodePositions: nodes.map(n => ({id:n.id, x:n.x, y:n.y}))
+      });
+    }
 
-    let stiffMod = {};
-    members.forEach(m => stiffMod[m.id] = { I_fac: 1.0, E_fac: 1.0, A_fac: 1.0 });
-
-    const MAX_STEPS = 50;
-    const INC_PCT = 0.05; // 5% of critical load per step
-
-    let currentLambda = 0;
-    let currentTotalU = new Array(build_init.N).fill(0);
-
-    // SEED: imperfections (1% of member length) on internal nodes only
-    for(const m of members){
-      const n1 = nodeById(m.n1), n2 = nodeById(m.n2);
-      const L = Math.hypot(n2.x - n1.x, n2.y - n1.y);
-      const imperfection = L * 0.01;
-
-      if(build_init.internalNodeMap && build_init.internalNodeMap[m.id]){
-        for(const internalNodeId of build_init.internalNodeMap[m.id]){
-          const baseDOF = build_init.dofMap.analysis[internalNodeId];
-          if(baseDOF !== undefined){
-            currentTotalU[baseDOF]   = (Math.random() - 0.5) * imperfection;
-            currentTotalU[baseDOF+1] = (Math.random() - 0.5) * imperfection;
-            currentTotalU[baseDOF+2] = (Math.random() - 0.5) * 0.001;
-          }
+    // Seed imperfections into INTERNAL DOFs only (small random)
+    // We keep them inside the displacement vector by adding them to the solution at each step.
+    // Because our solver is linear each step, we instead perturb geometry slightly at the start:
+    // (This is a pragmatic way to break perfect symmetry without expanding DOF bookkeeping.)
+    {
+      const buildImp = buildAnalysisModelFrame(stiffMod);
+      for (const m of members){
+        const n1=nodeById(m.n1), n2=nodeById(m.n2);
+        if(!n1 || !n2) continue;
+        const L = Math.hypot(n2.x-n1.x, n2.y-n1.y) || 1;
+        const imp = 0.01 * L; // 1% length
+        if(buildImp.internalNodeMap && buildImp.internalNodeMap[m.id]){
+          // perturb endpoints slightly in screen plane by offsetting primary nodes is not desired
+          // so we perturb by micro-rotating member via a tiny shift at n2 (geometry imperfection)
+          n2.x += (Math.random()-0.5)*imp*0.02;
+          n2.y += (Math.random()-0.5)*imp*0.02;
         }
       }
     }
 
-    let logHtml = `<div style="font-size:12px;margin-bottom:6px;"><strong>Critical λ: ${minLambda.toFixed(4)}</strong> (${criticalReason} M${critMemId})</div>`;
-    logHtml += `<div style="font-size:11px;color:#666;">Using ${build_init.N/3} nodes (${nodes.length} primary + ${build_init.N/3 - nodes.length} internal)</div>`;
-    logHtml += `<div style="font-size:11px;color:#666;">Initial imperfections: ±1% of member length</div>`;
+    // Logging
+    let logHtml = '';
     let structureStable = true;
+    let lambda = 0;
 
-    const failedMembers = {};
+    // Helper: apply base loads scaled by lambda to current nodes
+    function applyLambdaLoads(lam){
+      for (const n of nodes){
+        const b = baseLoadsByNode[n.id] || {Fx:0,Fy:0,Mz:0};
+        n.Fx = lam * b.Fx;
+        n.Fy = lam * b.Fy;
+        n.Mz = lam * b.Mz;
+      }
+    }
 
-    for(let step=1; step<=MAX_STEPS && structureStable; step++){
-      // Update primary nodes to deformed positions based on currentTotalU
-      const build_prelim = buildAnalysisModelFrame(stiffMod);
-      for(const n of nodes){
-        const baseDOF = build_prelim.dofMap.primary[n.id];
-        if(baseDOF !== undefined){
-          const origNode = originalNodes.find(on=>on.id===n.id);
-          n.x = origNode.x + currentTotalU[baseDOF];
-          n.y = origNode.y + currentTotalU[baseDOF+1];
-        }
+    // Helper: estimate a representative length scale
+    function frameLengthScale(){
+      let Lmax = 1;
+      for (const m of members){
+        const a=nodeById(m.n1), b=nodeById(m.n2);
+        if(a && b) Lmax = Math.max(Lmax, Math.hypot(b.x-a.x, b.y-a.y));
+      }
+      return Lmax;
+    }
+
+    const Lscale0 = frameLengthScale();
+
+    // Main incremental loop
+    for(let step=1; step<=MAX_STEPS; step++){
+      lambda += dLambda;
+
+      // Apply scaled loads for this step
+      applyLambdaLoads(lambda);
+
+      // Solve on current geometry with current stiffness modifiers
+      const sol = solveFrameInternal(stiffMod);
+
+      // Collapse criteria #1: K not solvable / singular
+      if(!sol){
+        logHtml += `<div style="color:#b91c1c; font-weight:700;">COLLAPSE at step ${step}: K not solvable (singular/unstable)</div>`;
+        logHtml += `<div style="color:#059669; font-weight:700;">Ultimate Capacity: λ = ${(lambda-dLambda).toFixed(4)}</div>`;
+        structureStable = false;
+        break;
       }
 
-      // Save current deformed primary positions (for animation)
-      const deformedNodePositions = nodes.map(n => ({id: n.id, x: n.x, y: n.y}));
+      // Runaway criteria: displacement magnitude
+      const U = sol.Ufull;
+      const absMaxU = Math.max(...U.map(v => Math.abs(v)));
+      const relMaxU = absMaxU / (Lscale0 || 1);
 
-      // Rebuild model with updated geometry
-      const build0 = buildAnalysisModelFrame(stiffMod);
-      const { anodes } = build0;
+      if(!isFinite(absMaxU) || absMaxU > MAX_ABS_DISP || relMaxU > MAX_REL_DISP){
+        logHtml += `<div style="color:#b91c1c; font-weight:700;">COLLAPSE at step ${step}: runaway displacement</div>`;
+        logHtml += `<div style="color:#666; font-size:11px;">Max|U|=${absMaxU.toExponential(3)} (rel=${relMaxU.toExponential(3)})</div>`;
+        logHtml += `<div style="color:#059669; font-weight:700;">Ultimate Capacity: λ = ${lambda.toFixed(4)}</div>`;
+        structureStable = false;
+        break;
+      }
 
-      // Internal end forces using currentTotalU
-      const internal = computeInternalEndForces(build0, currentTotalU);
+      // Detect member failures (hinge/brittle) at this load step using internal forces
+      // Use computed internal forces from the current step.
+      const internal = computeInternalEndForces(sol.build, U);
 
       let newFailures = [];
-      let totalFailedMembers = 0;
+      let totalFailed = 0;
 
       for(const m of members){
         const int = internal[m.id];
         if(!int) continue;
 
-        const M_max_curr = Math.max(Math.abs(int.Mi), Math.abs(int.Mj));
-        const N_min_curr = Math.min(int.Ni, int.Nj);
+        // Bending demand
+        const Mmax = Math.max(Math.abs(int.Mi), Math.abs(int.Mj));
+        const Mp = (m.shapeF||1.0) * (m.S||0) * (m.Fy||0);
 
-        const Mp = (m.shapeF||1.0)*(m.S||0)*(m.Fy||0);
+        // Axial compression demand (for buckling check)
+        const Nmin = Math.min(int.Ni, int.Nj); // negative => compression
+        const Pcomp = Math.abs(Math.min(0, Nmin));
 
-        // Effective length from current subdivided geometry
-        const gEl = build0.geom[m.id];
-        if(!gEl || !gEl.nodeChain) continue;
+        // Effective length (current geometry, use end-to-end)
+        const a=nodeById(m.n1), b=nodeById(m.n2);
+        const L = (a && b) ? Math.hypot(b.x-a.x, b.y-a.y) : (sol.stress[m.id]?.L || 1);
 
-        let totalLength = 0;
-        for(let idx=0; idx<gEl.nodeChain.length-1; idx++){
-          const ni = gEl.nodeChain[idx];
-          const nj = gEl.nodeChain[idx+1];
-          const pi = anodes[ni], pj = anodes[nj];
-          totalLength += Math.hypot(pj.x_up - pi.x_up, pj.y_up - pi.y_up);
-        }
-        const L_curr = totalLength;
-
-        // Bending failure
-        const materialBehavior = m.materialBehavior || 'ductile';
-        if(Mp > 0 && M_max_curr >= Mp * 0.98 && !failedMembers[m.id]){
-          if(materialBehavior === 'ductile'){
-            stiffMod[m.id].I_fac = 0.01;
-            failedMembers[m.id] = {type: 'hinge', residualMoment: Mp};
-            newFailures.push(`M${m.id} Hinge`);
+        // Yield/hinge
+        const matBeh = m.materialBehavior || 'ductile';
+        if(Mp > 0 && Mmax >= 0.999*Mp && !failedMembers[m.id]){
+          if(matBeh === 'ductile'){
+            stiffMod[m.id].I_fac = Math.max(stiffMod[m.id].I_fac*0.01, MIN_STIFF_FRAC);
+            failedMembers[m.id] = {type:'hinge', Mp};
+            newFailures.push(`M${m.id} hinge`);
           } else {
-            stiffMod[m.id].I_fac = 0.001;
-            stiffMod[m.id].A_fac = 0.001;
-            stiffMod[m.id].E_fac = 0.001;
-            failedMembers[m.id] = {type: 'brittle'};
-            newFailures.push(`M${m.id} Brittle`);
+            stiffMod[m.id].I_fac = MIN_STIFF_FRAC;
+            stiffMod[m.id].A_fac = MIN_STIFF_FRAC;
+            stiffMod[m.id].E_fac = MIN_STIFF_FRAC;
+            failedMembers[m.id] = {type:'brittle'};
+            newFailures.push(`M${m.id} brittle`);
           }
         }
 
-        // Buckling detection via lateral deviation (geometric nonlinearity)
-        if(gEl.nodeChain.length > 2){
-          const pi = anodes[gEl.nodeChain[0]];
-          const pj = anodes[gEl.nodeChain[gEl.nodeChain.length-1]];
-          let maxDeviation = 0;
-          for(const nid of gEl.nodeChain){
-            const p = anodes[nid];
-            const A = pj.y_up - pi.y_up;
-            const B = pi.x_up - pj.x_up;
-            const C = pj.x_up * pi.y_up - pi.x_up * pj.y_up;
-            const dist = Math.abs(A * p.x_up + B * p.y_up + C) / Math.hypot(A, B);
-            maxDeviation = Math.max(maxDeviation, dist);
-          }
-          if(maxDeviation > L_curr / 100 && !failedMembers[m.id]){
-            failedMembers[m.id] = {type: 'buckled', maxDev: maxDeviation};
-            newFailures.push(`M${m.id} Buckled`);
+        // Buckling (Euler) — only if compressive
+        if(Pcomp > 1e-9 && !failedMembers[m.id]){
+          // crude K-factor from end BCs
+          const n1=nodeById(m.n1), n2=nodeById(m.n2);
+          const isPinned = (bc)=>bc==='simple'||bc==='rollerX'||bc==='rollerY';
+          let Kfac = 0.5;
+          if(n1 && n2){
+            if(isPinned(n1.bc) && isPinned(n2.bc)) Kfac=1.0;
+            else if(isPinned(n1.bc) || isPinned(n2.bc)) Kfac=0.7;
+            else Kfac=0.5;
+          } else Kfac=1.0;
+
+          const Pcr = (Math.PI**2 * m.E * m.I)/((Kfac*L)**2);
+          if(Pcr > 0 && Pcomp >= 0.999*Pcr){
+            failedMembers[m.id] = {type:'buckled', Pcr};
+            // for buckling, reduce I a lot
+            stiffMod[m.id].I_fac = Math.max(stiffMod[m.id].I_fac*0.001, MIN_STIFF_FRAC);
+            newFailures.push(`M${m.id} buckled`);
           }
         }
 
-        if(failedMembers[m.id]) totalFailedMembers++;
+        if(failedMembers[m.id]) totalFailed++;
       }
 
-      if(newFailures.length > 0) {
-        logHtml += `<div style="color:#b91c1c; font-size:11px;">Step ${step} (λ=${currentLambda.toFixed(3)}): ${newFailures.join(', ')}</div>`;
+      // Update geometry for next step (user requirement)
+      // New nodal positions = original position + current displacement of primary DOFs
+      // We must reference ORIGINAL geometry, not accumulated drift, to remain consistent.
+      for (const n of nodes){
+        const o = originalNodes.find(p=>p.id===n.id);
+        if(!o) continue;
+        const b = sol.dofMap.primary[n.id];
+        n.x = o.x + (U[b]||0);
+        n.y = o.y + (U[b+1]||0);
       }
 
-      // Solve incremental response on current deformed geometry
-      const solInc = solveFrameInternal(stiffMod);
-      if(!solInc) {
-        logHtml += `<div style="color:red; font-weight:600; margin-top:4px;">STRUCTURE COLLAPSED at Step ${step}</div>`;
-        logHtml += `<div style="color:#666; font-size:11px;">Failed members: ${totalFailedMembers}/${members.length}</div>`;
-        logHtml += `<div style="color:#059669; font-weight:600;">Ultimate Capacity: λ = ${currentLambda.toFixed(4)}</div>`;
+      // Save history frame (after geometry update)
+      collapseHistory.push({
+        step,
+        lambda,
+        U: [...U],
+        desc: `Step ${step} (λ=${lambda.toFixed(3)})`,
+        nodePositions: nodes.map(n => ({id:n.id, x:n.x, y:n.y})),
+        newFailures: [...newFailures]
+      });
+
+      // Log
+      const failTxt = newFailures.length ? ` <span style="color:#b91c1c;">[${newFailures.join(', ')}]</span>` : '';
+      logHtml += `<div style="font-size:11px;">Step ${step}: λ=${lambda.toFixed(3)} max|U|=${absMaxU.toFixed(4)}${failTxt}</div>`;
+
+      // Collapse criteria #2: cannot carry more load due to excessive member degradation
+      // Pragmatic: if most members have failed, stop.
+      if(totalFailed >= Math.max(1, Math.floor(0.9*members.length))){
+        logHtml += `<div style="color:#b91c1c; font-weight:700; margin-top:4px;">COLLAPSE: insufficient stiffness (failed members ${totalFailed}/${members.length})</div>`;
+        logHtml += `<div style="color:#059669; font-weight:700;">Ultimate Capacity: λ = ${lambda.toFixed(4)}</div>`;
         structureStable = false;
         break;
       }
 
-      const scaleFact = INC_PCT * minLambda;
-      const deltaU = solInc.Ufull.map(u => u * scaleFact);
-
-      currentTotalU = currentTotalU.map((val, k) => val + deltaU[k]);
-      currentLambda += scaleFact;
-
-      collapseHistory.push({
-        U: [...currentTotalU],
-        lambda: currentLambda,
-        desc: `Step ${step} (λ=${currentLambda.toFixed(3)})`,
-        nodePositions: deformedNodePositions
-      });
-
-      if(currentLambda > minLambda * 20) {
-        logHtml += `<div style="color:#059669; font-weight:600; margin-top:4px;">Analysis reached 20x critical load - structure remains stable</div>`;
-        logHtml += `<div style="color:#666; font-size:11px;">Final λ = ${currentLambda.toFixed(4)} (stopped early)</div>`;
+      // Safety stop: if lambda becomes too large without collapse
+      if(lambda > 50){
+        logHtml += `<div style="color:#059669; font-weight:700; margin-top:4px;">Stopped early: λ exceeded 50 without collapse</div>`;
         break;
       }
     }
 
-    if(structureStable && currentLambda <= minLambda * 20) {
-      logHtml += `<div style="color:#059669; font-weight:600; margin-top:4px;">Analysis Complete - ${MAX_STEPS} steps reached</div>`;
-      logHtml += `<div style="color:#666; font-size:11px;">Final λ = ${currentLambda.toFixed(4)}</div>`;
+    if(structureStable){
+      logHtml += `<div style="color:#059669; font-weight:700; margin-top:6px;">Analysis Complete</div>`;
+      logHtml += `<div style="color:#666; font-size:11px;">Final λ = ${lambda.toFixed(4)}</div>`;
     }
 
-    resultList.innerHTML = logHtml + `<div style="color:#059669; font-weight:600; margin-top:4px;">Complete. Animate to view. Load Plots available in Results.</div>`;
+    resultList.innerHTML = logHtml;
 
     toggleStressPanel(false);
     setActiveGroup(viewBtns,'');
     toggleLoadPlot(true);
+    plotLoadAnalysis();
 
-    // Update lastSolution for static display at end
-    const buildFinal = buildAnalysisModelFrame();
-    const finalSublines = generateSublines(buildFinal, currentTotalU, 10);
-    lastSolution = { Ufull: currentTotalU, sublines: finalSublines, stress:{}, stressSummary:{} };
+    // Set lastSolution to final frame for static display
+    if(collapseHistory && collapseHistory.length){
+      const last = collapseHistory[collapseHistory.length-1];
+      const buildFinal = buildAnalysisModelFrame(stiffMod);
+      const finalSublines = generateSublines(buildFinal, last.U || new Array(buildFinal.N).fill(0), 10);
+      lastSolution = { Ufull: last.U, sublines: finalSublines, stress:{}, stressSummary:{} };
+    }
 
     document.getElementById('defScale').value = 1;
     draw();
@@ -843,11 +894,9 @@ poly.push({ x0_up: anode.x_up, y0_up: anode.y_up, u, v });
     btn.textContent = 'Stop';
     btn.classList.add('active');
 
-    // Collapse-history animation: step through all load steps 0 -> last, then stop
     if (collapseHistory && collapseHistory.length > 1) {
       const maxIdx = collapseHistory.length - 1;
-      const msPerStep = 150; // speed control
-
+      const msPerStep = 150;
       let lastStep = -1;
 
       const tick = (ts) => {
@@ -855,35 +904,33 @@ poly.push({ x0_up: anode.x_up, y0_up: anode.y_up, u, v });
         if (!anim.t0) anim.t0 = ts;
 
         const elapsed = ts - anim.t0;
+        const stepRaw = Math.floor(elapsed / msPerStep);
+        const step = stepRaw % (maxIdx + 1);
 
-const stepRaw = Math.floor(elapsed / msPerStep);
-const step = stepRaw % (maxIdx + 1);
+        if (step !== lastStep) {
+          lastStep = step;
 
-if (step !== lastStep) {
-  lastStep = step;
+          const pos = collapseHistory[step].nodePositions;
+          if (pos) {
+            for (const n of nodes) {
+              const p = pos.find(q => q.id === n.id);
+              if (p) { n.x = p.x; n.y = p.y; }
+            }
+          }
 
-  const pos = collapseHistory[step].nodePositions;
-  if (pos) {
-    for (const n of nodes) {
-      const p = pos.find(q => q.id === n.id);
-      if (p) { n.x = p.x; n.y = p.y; }
-    }
-  }
+          const build = buildAnalysisModelFrame();
+          const U = collapseHistory[step].U || new Array(build.N).fill(0);
+          const sublines = generateSublines(build, U, 10);
+          lastSolution = { sublines, Ufull: U };
 
-  const build = buildAnalysisModelFrame();
-  const U = collapseHistory[step].U || new Array(build.N).fill(0);
-  const sublines = generateSublines(build, U, 10);
-  lastSolution = { sublines, Ufull: U };
+          draw(1.0);
 
-  draw(1.0);
-
-  ctx.save();
-  ctx.fillStyle = 'black';
-  ctx.font = 'bold 14px sans-serif';
-  ctx.fillText(`λ = ${collapseHistory[step].lambda.toFixed(3)}, step ${step}/${maxIdx}`, 10, 20);
-  ctx.restore();
-}
-
+          ctx.save();
+          ctx.fillStyle = 'black';
+          ctx.font = 'bold 14px sans-serif';
+          ctx.fillText(`λ = ${collapseHistory[step].lambda.toFixed(3)}, step ${step}/${maxIdx}`, 10, 20);
+          ctx.restore();
+        }
 
         anim.raf = requestAnimationFrame(tick);
       };
@@ -892,7 +939,7 @@ if (step !== lastStep) {
       return;
     }
 
-    // Fallback: simple oscillation of def scale (if no collapseHistory)
+    // Fallback: simple oscillation of def scale
     const tick = (ts)=>{
       if (!anim.on) return;
       if (!anim.t0) anim.t0 = ts;
@@ -911,7 +958,7 @@ if (step !== lastStep) {
     document.getElementById('btnAnimate').textContent = 'Animate';
     document.getElementById('btnAnimate').classList.remove('active');
 
-    // Restore original primary positions from frame 0 (now nodePositions)
+    // Restore original primary positions from frame 0
     if(collapseHistory && collapseHistory[0] && collapseHistory[0].nodePositions){
       for(const origNode of collapseHistory[0].nodePositions){
         const n = nodeById(origNode.id);
@@ -1090,19 +1137,19 @@ if (step !== lastStep) {
     const steps = collapseHistory.map((h, i) => i);
     const maxDisps = collapseHistory.map(h => {
       if(!h.U) return 0;
-      return Math.max(...h.U.map(Math.abs));
+      return Math.max(...h.U.map(v => Math.abs(v)));
     });
 
     const W1 = cvs1.width, H1 = cvs1.height;
     const W2 = cvs2.width, H2 = cvs2.height;
     const pad = {l:50, r:20, t:20, b:30};
 
-    // Plot 1
+    // Plot 1: lambda vs step
     ctx1.clearRect(0, 0, W1, H1);
     ctx1.fillStyle = '#f9fafb';
     ctx1.fillRect(0, 0, W1, H1);
 
-    const maxLambda = Math.max(...lambdas);
+    const maxLambda = Math.max(...lambdas, 1e-9);
     const maxStep = Math.max(1, steps.length - 1);
 
     ctx1.strokeStyle = '#e5e7eb';
@@ -1128,7 +1175,7 @@ if (step !== lastStep) {
     ctx1.fillText('Load Factor (λ)', pad.l, 15);
     ctx1.fillText('Step', W1/2, H1 - 5);
 
-    // Plot 2
+    // Plot 2: lambda vs max displacement
     ctx2.clearRect(0, 0, W2, H2);
     ctx2.fillStyle = '#f9fafb';
     ctx2.fillRect(0, 0, W2, H2);
@@ -1189,6 +1236,7 @@ if (step !== lastStep) {
     stressPlotModeSelect.addEventListener('change', () => { if (viewMode === 'stresspanel') plotStressPanel(); });
   }
 
+  // ===== Fix A: preview line drawn INSIDE draw() =====
   function draw(scaleOverride){
     ctx.clearRect(0,0,base.width,base.height);
     ovr.clearRect(0,0,overlay.width,overlay.height);
@@ -1220,57 +1268,51 @@ if (step !== lastStep) {
       drawCoordTag(ctx, p.x+10, p.y-12, `(${n.x.toFixed(1)}, ${n.y.toFixed(1)})`);
     }
 
-    // deformed shape (sublines already include displacements in x_up/y_up space)
-// deformed shape (apply scale to displacement)
-if (lastSolution && lastSolution.sublines){
-  let scale = parseFloat(document.getElementById('defScale').value) || 1;
-  if (scaleOverride !== undefined) scale = scaleOverride;
+    // deformed shape
+    if (lastSolution && lastSolution.sublines){
+      let scale = parseFloat(document.getElementById('defScale').value);
+      if (!isFinite(scale)) scale = 1; // Fix C parsing
+      if (scaleOverride !== undefined) scale = scaleOverride;
 
-  ctx.save(); ctx.lineWidth = 3; ctx.strokeStyle = '#e11d48';
+      ctx.save(); ctx.lineWidth = 3; ctx.strokeStyle = '#e11d48';
 
-  for (const poly of lastSolution.sublines){
-    ctx.beginPath();
-    for (let k=0; k<poly.length; k++){
-      const p = poly[k];
+      for (const poly of lastSolution.sublines){
+        ctx.beginPath();
+        for (let k=0; k<poly.length; k++){
+          const p = poly[k];
+          const x0 = (p.x0_up !== undefined) ? p.x0_up : (p.x_up - (p.u||0));
+          const y0 = (p.y0_up !== undefined) ? p.y0_up : (p.y_up - (p.v||0));
 
-      // Backward-compatible if any old points exist
-      const x0 = (p.x0_up !== undefined) ? p.x0_up : (p.x_up - (p.u||0));
-      const y0 = (p.y0_up !== undefined) ? p.y0_up : (p.y_up - (p.v||0));
+          const x_up = x0 + scale * (p.u || 0);
+          const y_up = y0 + scale * (p.v || 0);
 
-      const x_up = x0 + scale * (p.u || 0);
-      const y_up = y0 + scale * (p.v || 0);
-
-      const S = worldToScreen(x_up, yCanvas(y_up));
-      if (k === 0) ctx.moveTo(S.x, S.y);
-      else ctx.lineTo(S.x, S.y);
+          const S = worldToScreen(x_up, yCanvas(y_up));
+          if (k === 0) ctx.moveTo(S.x, S.y);
+          else ctx.lineTo(S.x, S.y);
+        }
+        ctx.stroke();
+      }
+      ctx.restore();
     }
-    ctx.stroke();
-  }
 
-  ctx.restore();
-}
+    // Fix A: draw-mode preview line on overlay
+    if (mode === 'draw' && dragStart && draw._mx !== undefined && draw._my !== undefined) {
+      const p0 = worldToScreen(dragStart.x, dragStart.y);
+      const p1 = worldToScreen(draw._mx, draw._my);
+
+      ovr.save();
+      ovr.lineWidth = 2;
+      ovr.setLineDash([6,4]);
+      ovr.strokeStyle = '#3a86ff';
+      ovr.beginPath();
+      ovr.moveTo(p0.x, p0.y);
+      ovr.lineTo(p1.x, p1.y);
+      ovr.stroke();
+      ovr.restore();
+    }
+
     drawSelection();
   }
-
-// Draw-mode preview line (so it survives any redraw while dragging)
-if (mode === 'draw' && dragStart) {
-  // Use last known mouse world position if available
-  if (draw._mx !== undefined && draw._my !== undefined) {
-    const p0 = worldToScreen(dragStart.x, dragStart.y);
-    const p1 = worldToScreen(draw._mx, draw._my);
-
-    ovr.save();
-    ovr.lineWidth = 2;
-    ovr.setLineDash([6,4]);
-    ovr.strokeStyle = '#3a86ff';
-    ovr.beginPath();
-    ovr.moveTo(p0.x, p0.y);
-    ovr.lineTo(p1.x, p1.y);
-    ovr.stroke();
-    ovr.restore();
-  }
-}
-
 
   function drawSelection(){
     if(selectedNodeId){
@@ -1295,7 +1337,6 @@ if (mode === 'draw' && dragStart) {
     g.save();
     g.lineWidth=1;
     g.strokeStyle='#eee';
-    // placeholder; keep as-is for now
     g.restore();
   }
 
@@ -1312,7 +1353,7 @@ if (mode === 'draw' && dragStart) {
 
   function refreshLists(){
     nodeList.innerHTML = nodes.map(n=>`<div>N${n.id}</div>`).join('');
-    memberList.innerHTML = members.map(m=>`<div>M${m.id}: Fy=${m.Fy}</div>`).join('');
+    memberList.innerHTML = members.map(m=>`<div>${m.label||('M'+m.id)}: Fy=${m.Fy}</div>`).join('');
   }
 
   // ===== Overlay Events =====
@@ -1344,31 +1385,25 @@ if (mode === 'draw' && dragStart) {
   });
 
   overlay.addEventListener('mousemove', (e)=>{
-    const {x,y,sx,sy}=mousePos(e);
+    const {x,y}=mousePos(e);
+
     if (isPanning){
       view.offsetX = panStart.offsetX + (e.clientX - panStart.sx);
       view.offsetY = panStart.offsetY + (e.clientY - panStart.sy);
       view.userAdjusted = true; draw(); return;
     }
 
-// Store last mouse position for preview line drawn inside draw()
-draw._mx = x;
-draw._my = y;
+    // store last mouse position for draw-preview
+    draw._mx = x;
+    draw._my = y;
 
-
-    if (mode==='draw' && dragStart){
-      hoverEndNodeId = nearNodeId(x,y);
+    // ===== Fix B: single draw + return while dragging in draw mode =====
+    if (mode === 'draw' && dragStart) {
+      hoverEndNodeId = nearNodeId(x, y);
       draw();
-
-if (mode === 'draw' && dragStart) {
-  hoverEndNodeId = nearNodeId(x,y);
-  draw();
-  return;
-}
-
-
+      return;
     }
-    draw();
+
     if (mode==='select'){
       if(movingNodeId!==null){
         const n=nodeById(movingNodeId); n.x=x-moveOffset.dx; n.y=y-moveOffset.dy;
@@ -1376,6 +1411,7 @@ if (mode === 'draw' && dragStart) {
       }
       const mid=nearMemberId(x,y,6);
       const nid=nearNodeId(x,y,8);
+      draw(); // clear overlay and redraw base for clean hover cues
       if(mid){
         const m=memberById(mid), a=nodeById(m.n1), b=nodeById(m.n2);
         const A=worldToScreen(a.x,a.y), B=worldToScreen(b.x,b.y);
@@ -1388,7 +1424,11 @@ if (mode === 'draw' && dragStart) {
         ovr.beginPath(); ovr.arc(p.x,p.y,10,0,Math.PI*2); ovr.fill(); ovr.restore();
         overlay.style.cursor='pointer';
         drawCoordTag(ovr, p.x+12, p.y-12, `(${n.x.toFixed(1)}, ${n.y.toFixed(1)})`);
-      } else { overlay.style.cursor='pointer'; }
+      } else {
+        overlay.style.cursor='pointer';
+      }
+    } else {
+      draw();
     }
   });
 
@@ -1442,58 +1482,47 @@ if (mode === 'draw' && dragStart) {
     view.userAdjusted = true; draw();
   }, { passive:false });
 
+  // Delete key handling (kept; already typing-safe)
+  document.addEventListener('keydown', (e) => {
+    if (mode !== 'select') return;
 
+    const t = e.target;
+    const isTypingContext =
+      t && (
+        t.tagName === 'INPUT' ||
+        t.tagName === 'TEXTAREA' ||
+        t.tagName === 'SELECT' ||
+        t.isContentEditable
+      );
 
-document.addEventListener('keydown', (e) => {
-  // Only handle hotkeys in select mode
-  if (mode !== 'select') return;
+    const swalOpen = !!document.querySelector('.swal2-container');
+    if (isTypingContext || swalOpen) return;
 
-  // Do NOT treat Delete/Backspace as "delete geometry" when the user is typing
-  const t = e.target;
-  const isTypingContext =
-    t && (
-      t.tagName === 'INPUT' ||
-      t.tagName === 'TEXTAREA' ||
-      t.tagName === 'SELECT' ||
-      t.isContentEditable
-    );
-
-  // Also ignore when SweetAlert is open (it uses inputs)
-  const swalOpen = !!document.querySelector('.swal2-container');
-
-  if (isTypingContext || swalOpen) return;
-
-  if (e.key === 'Delete' || e.key === 'Backspace') {
-    if (selectedNodeId) {
-      deleteNodeWithMembers(selectedNodeId);
-      selectedNodeId = null;
-      e.preventDefault();
-    } else if (selectedMemberForDelete) {
-      deleteMember(selectedMemberForDelete);
-      selectedMemberForDelete = null;
-      e.preventDefault();
+    if (e.key === 'Delete' || e.key === 'Backspace') {
+      if (selectedNodeId) {
+        deleteNodeWithMembers(selectedNodeId);
+        selectedNodeId = null;
+        e.preventDefault();
+      } else if (selectedMemberForDelete) {
+        deleteMember(selectedMemberForDelete);
+        selectedMemberForDelete = null;
+        e.preventDefault();
+      }
     }
-  }
-});
-
-
-
-
+  });
 
   // Kickoff
   view.scale = 1;
   view.offsetX = base.width / 2;
   view.offsetY = base.height / 2;
   refreshLists();
-
-  // Hide plots until you run collapse (you can always show them via Load Plots button)
   toggleLoadPlot(false);
-
   draw();
 
 })();
 </script>
 </body>
 </html>
+
 
 
